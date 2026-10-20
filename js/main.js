@@ -38,8 +38,29 @@ function loadSave() {
   } catch (e) { /* ignore */ }
   return def;
 }
+// Set just before a deliberate reload (loading a code, resetting) so the save-on-close
+// handlers don't write the old in-memory progress back over the new data.
+let reloading = false;
 function persist() {
+  if (reloading) return;
   try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) { /* ignore */ }
+}
+// Ask the browser not to clear our saved data when the phone is low on space.
+function askPersistentStorage() {
+  try { navigator.storage?.persist?.(); } catch (e) { /* ignore */ }
+}
+
+// Progress code: iPhone keeps Safari and Home Screen app data apart, so this moves it across.
+function progressCode() {
+  const data = { v: 2, save, run: readRun() };
+  return 'BP-' + btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+}
+function loadProgressCode(code) {
+  const raw = code.trim().replace(/^BP-/, '').replace(/\s+/g, '');
+  const data = JSON.parse(decodeURIComponent(escape(atob(raw))));
+  if (!data || !data.save || typeof data.save.level !== 'number' || typeof data.save.coins !== 'number') throw new Error('bad code');
+  localStorage.setItem(SAVE_KEY, JSON.stringify(data.save));
+  if (data.run) localStorage.setItem(RUN_KEY, JSON.stringify(data.run)); else localStorage.removeItem(RUN_KEY);
 }
 function addCoins(n) {
   save.coins = Math.max(0, save.coins + n);
@@ -167,7 +188,7 @@ function clearLevel() {
   G = null;
 }
 
-function loadLevel(n) {
+function loadLevel(n, run = null) {
   clearLevel();
   const level = generateLevel(n);
   const maxSlots = level.slots + EXTRA_SLOTS;
@@ -223,6 +244,7 @@ function loadLevel(n) {
   G.moreLabel.visible = false;
   root.add(G.moreLabel);
 
+  if (run) restoreRun(run);
   buildLockTiles();
   revealFreeMysteries(true);
   syncQueueMeshes(true);
@@ -230,6 +252,68 @@ function loadLevel(n) {
   updateHud();
   showTutorial();
 }
+
+// ---------------- Level in progress (resume after closing the app) ----------------
+const RUN_KEY = 'busparty-run-v1';
+function readRun() {
+  try {
+    const r = JSON.parse(localStorage.getItem(RUN_KEY));
+    return r && typeof r === 'object' && Array.isArray(r.vs) ? r : null;
+  } catch (e) { return null; }
+}
+function clearRun() {
+  try { localStorage.removeItem(RUN_KEY); } catch (e) { /* ignore */ }
+}
+// Saves the current level as if every moving vehicle and walking passenger had arrived.
+function saveRun() {
+  if (reloading || !G || (G.state !== 'playing' && G.state !== 'lost')) return;
+  const vs = G.vehicles.map((v) => {
+    let st = v.state;
+    if (st === 'bump') st = 'lot';
+    if (st === 'drive' || st === 'fly') st = 'parked';
+    if (st === 'leave') st = 'gone';
+    const f = v.filled + v.incoming;
+    if (st === 'parked' && f >= v.seats) st = 'gone';
+    return { s: st, slot: v.slot, f, c: v.color, m: v.mystery, t: v.tapOrder };
+  });
+  const run = {
+    n: G.n, unlocked: G.unlocked, tap: G.tapCounter, boarded: G.boarded + G.walkers.length,
+    queue: G.queue.map((p) => p.color), vs,
+  };
+  try { localStorage.setItem(RUN_KEY, JSON.stringify(run)); } catch (e) { /* ignore */ }
+}
+function restoreRun(run) {
+  if (run.n !== G.n || run.vs.length !== G.vehicles.length) return;
+  G.unlocked = Math.min(G.maxSlots, Math.max(G.unlocked, run.unlocked | 0));
+  G.tapCounter = run.tap | 0;
+  G.boarded = run.boarded | 0;
+  G.queue = run.queue.map((c) => ({ color: c, mesh: null, walk: 0 }));
+  run.vs.forEach((r, i) => {
+    const v = G.vehicles[i];
+    v.color = r.c;
+    if (v.mystery && !r.m) reveal(v, true);
+    else if (!v.mystery) setVehicleColor(v.m, COLORS[v.color].hex);
+    if (r.s === 'gone') {
+      v.state = 'gone';
+      G.root.remove(v.m.root);
+    } else if (r.s === 'parked' && r.slot >= 0 && !G.slots[r.slot]) {
+      v.slot = r.slot;
+      v.filled = r.f;
+      v.tapOrder = r.t;
+      G.slots[r.slot] = v;
+      if (v.mystery) reveal(v, true);
+      arrive(v);
+    }
+  });
+}
+// Save a few times a second while playing, and right away when the app is closed.
+let runSaveT = 0;
+function tickRunSave(dt) {
+  runSaveT += dt;
+  if (runSaveT > 0.5) { runSaveT = 0; saveRun(); }
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden) { saveRun(); persist(); } });
+window.addEventListener('pagehide', () => { saveRun(); persist(); });
 
 function buildLockTiles() {
   for (const t of G.lockTiles) G.root.remove(t);
@@ -687,6 +771,7 @@ function win() {
   const first = !save.cleared[G.n];
   const reward = first ? ECON.reward[kind] : ECON.replayReward;
   save.cleared[G.n] = true;
+  clearRun();
   if (G.n === save.level && save.level < MAX_LEVEL) save.level = G.n + 1;
   addCoins(reward);
   sfx.win();
@@ -959,7 +1044,9 @@ ui.playBtn.addEventListener('click', () => {
   sfx.tap();
   hide(ui.home);
   ui.hud.classList.add('show');
-  startLevel(save.level);
+  askPersistentStorage();
+  const run = readRun();
+  startLevel(save.level, run && run.n === save.level ? run : null);
 });
 ui.levelsBtn.addEventListener('click', () => { unlockAudio(); sfx.tap(); openLevels(); });
 ui.levelsClose.addEventListener('click', () => hide(ui.levels));
@@ -968,7 +1055,7 @@ ui.winNext.addEventListener('click', () => {
   hide(ui.win);
   startLevel(Math.min(G.n + 1, MAX_LEVEL));
 });
-ui.loseRetry.addEventListener('click', () => { sfx.tap(); hide(ui.lose); startLevel(G.n); });
+ui.loseRetry.addEventListener('click', () => { sfx.tap(); hide(ui.lose); clearRun(); startLevel(G.n); });
 ui.loseSpot.addEventListener('click', () => {
   if (save.coins < ECON.price.spot) { notEnough('spot'); return; }
   applyBooster('spot');
@@ -1003,8 +1090,8 @@ ui.vibeToggle.addEventListener('click', () => {
   buzz(30);
 });
 ui.homeSettings.addEventListener('click', () => { unlockAudio(); sfx.tap(); renderSettings(); show(ui.settings); });
-ui.restartBtn.addEventListener('click', () => { hide(ui.settings); startLevel(G.n); });
-ui.homeBtn.addEventListener('click', () => { hide(ui.settings); goHome(); });
+ui.restartBtn.addEventListener('click', () => { hide(ui.settings); clearRun(); startLevel(G.n); });
+ui.homeBtn.addEventListener('click', () => { hide(ui.settings); saveRun(); goHome(); });
 let resetArmed = false;
 ui.resetBtn.addEventListener('click', () => {
   if (!resetArmed) {
@@ -1013,10 +1100,40 @@ ui.resetBtn.addEventListener('click', () => {
     setTimeout(() => { resetArmed = false; ui.resetBtn.textContent = 'Reset progress'; }, 3000);
     return;
   }
+  reloading = true;
   try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* ignore */ }
+  clearRun();
   location.reload();
 });
 ui.tipOk.addEventListener('click', () => hide(ui.tip));
+
+// Move progress between Safari and the Home Screen app.
+const $ = (id) => document.getElementById(id);
+$('transferBtn').addEventListener('click', () => {
+  saveRun();
+  persist();
+  $('myCode').value = progressCode();
+  $('pasteCode').value = '';
+  hide(ui.settings);
+  show($('transfer'));
+});
+$('transferClose').addEventListener('click', () => hide($('transfer')));
+$('copyCode').addEventListener('click', () => {
+  const box = $('myCode');
+  const done = () => toast('Code copied');
+  const fallback = () => { box.focus(); box.select(); box.setSelectionRange(0, box.value.length); toast('Code selected, tap Copy'); };
+  try { navigator.clipboard.writeText(box.value).then(done, fallback); } catch (e) { fallback(); }
+});
+$('loadCode').addEventListener('click', () => {
+  try {
+    loadProgressCode($('pasteCode').value);
+    reloading = true;
+    toast('Progress loaded!');
+    setTimeout(() => location.reload(), 600);
+  } catch (e) {
+    toast('That code didn’t work. Copy it again and paste the whole thing.');
+  }
+});
 
 function renderSettings() {
   ui.soundToggle.textContent = save.sound ? 'Sound: On 🔊' : 'Sound: Off 🔇';
@@ -1027,13 +1144,14 @@ function renderSettings() {
   ui.homeBtn.style.display = ui.hud.classList.contains('show') ? '' : 'none';
 }
 
-function startLevel(n) {
+function startLevel(n, run = null) {
   hide(ui.win); hide(ui.lose); hide(ui.levels); hide(ui.home); hide(ui.buy);
   ui.hud.classList.add('show');
   ui.vipBanner.classList.remove('show');
   ui.boosters.querySelector('[data-booster="vip"]').classList.remove('active');
   boardTimer = 0;
-  loadLevel(n);
+  runSaveT = 0;
+  loadLevel(n, run);
   checkBoosterUnlocks();
 }
 
@@ -1057,7 +1175,8 @@ function goHome() {
   ui.hud.classList.remove('show');
   ui.tutorial.classList.remove('show');
   ui.hand.style.display = 'none';
-  ui.homeLevel.textContent = `Level ${save.level}`;
+  const run = readRun();
+  ui.homeLevel.textContent = run && run.n === save.level ? `Continue Level ${save.level}` : `Level ${save.level}`;
   ui.homeCoins.textContent = save.coins;
   loadLevel(save.level);
   G.state = 'menu';
@@ -1092,6 +1211,7 @@ function frame(now) {
   if (G) {
     G.time += dt;
     if (G.state === 'playing' || G.state === 'won') {
+      if (G.state === 'playing') tickRunSave(dt);
       updateVehicles(dt);
       updateBoarding(dt);
       updateQueue(dt);
@@ -1110,7 +1230,7 @@ requestAnimationFrame(frame);
 
 // Test hooks used by the automated play-tester.
 window.__bp = {
-  get G() { return G; }, tapVehicle, requestBooster, applyBooster, startLevel, blockInfo, freeSlot, save, ECON,
+  get G() { return G; }, tapVehicle, requestBooster, applyBooster, startLevel, blockInfo, freeSlot, save, ECON, saveRun, readRun,
   step(dt) { G.time += dt; updateVehicles(dt); updateBoarding(dt); updateQueue(dt); checkEnd(dt); },
 };
 

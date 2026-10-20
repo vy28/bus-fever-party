@@ -100,6 +100,7 @@
       <button id="vibeToggle" class="mid blue">Vibration: On</button>
       <button id="restartBtn" class="mid yellow">↻ Restart Level</button>
       <button id="homeBtn" class="mid purple">🏠 Home</button>
+      <button id="transferBtn" class="mid yellow">📲 Move progress</button>
       <button id="resetBtn" class="small ghost">Reset progress</button>
       <button id="settingsClose" class="mid green">Done</button>
     </div>
@@ -111,6 +112,19 @@
       <h2 id="tipTitle">Tip</h2>
       <p id="tipText"></p>
       <button id="tipOk" class="mid green">Got it!</button>
+    </div>
+  </div>
+
+  <!-- Move progress between Safari and the Home Screen app -->
+  <div id="transfer" class="screen modal-screen">
+    <div class="panel">
+      <h2>Move progress</h2>
+      <p>iPhone keeps Safari and the Home Screen app separate. Copy this code where your progress is, then paste it in the other one.</p>
+      <textarea id="myCode" readonly rows="3" aria-label="Your progress code"></textarea>
+      <button id="copyCode" class="mid blue">Copy my code</button>
+      <textarea id="pasteCode" rows="3" placeholder="Paste a code here" aria-label="Paste a progress code"></textarea>
+      <button id="loadCode" class="mid green">Load this code</button>
+      <button id="transferClose" class="small ghost">Close</button>
     </div>
   </div>
 
