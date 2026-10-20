@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>Bus Party!</title>
+  <meta name="description" content="A cozy 3D bus parking puzzle. Tap buses out of the jam and match them with passengers.">
+  <meta name="theme-color" content="#3aa0ff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Bus Party">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="importmap">{ "imports": { "three": "./js/vendor/three.module.min.js" } }</script>
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <!-- In-game HUD -->
+  <div id="hud">
+    <div class="topbar">
+      <button id="settingsBtn" class="round" aria-label="Settings">⚙️</button>
+      <div class="levelpill">
+        <div><span id="levelLabel">Level 1</span> <span id="levelBadge" class="badge"></span></div>
+        <div class="progress"><div id="progressFill"></div></div>
+      </div>
+      <div class="coins"><span class="coin">🪙</span><span id="coinCount">0</span></div>
+    </div>
+    <div id="boosters" class="boosters">
+      <button data-booster="spot"><span class="ico">🅿️</span><span class="name">+Spot</span><span class="count">2</span></button>
+      <button data-booster="shuffle"><span class="ico">🔀</span><span class="name">Shuffle</span><span class="count">2</span></button>
+      <button data-booster="vip"><span class="ico">🚁</span><span class="name">VIP Lift</span><span class="count">2</span></button>
+    </div>
+  </div>
+
+  <div id="vipBanner">🚁 Tap any vehicle to lift it out!</div>
+  <div id="toast"></div>
+  <div id="hand">👆</div>
+  <div id="tutorial"><p id="tutText"></p></div>
+  <div id="confetti"></div>
+
+  <!-- Home -->
+  <div id="home" class="screen">
+    <div class="homecoins"><span class="coin">🪙</span><span id="homeCoins">0</span></div>
+    <div class="logo">
+      <div class="logo-top">BUS</div>
+      <div class="logo-bot">PARTY!</div>
+      <div class="logo-bus">🚌</div>
+    </div>
+    <div class="homebtns">
+      <button id="playBtn" class="big green"><span>PLAY</span><small id="homeLevel">Level 1</small></button>
+      <div class="row">
+        <button id="levelsBtn" class="mid blue">🗺️ Levels</button>
+        <button class="mid purple" onclick="document.getElementById('settingsBtn').click()">⚙️ Settings</button>
+      </div>
+    </div>
+    <p class="foot">No ads. Ever. Made with ❤️</p>
+  </div>
+
+  <!-- Level select -->
+  <div id="levels" class="screen modal-screen">
+    <div class="panel tall">
+      <h2>Levels</h2>
+      <div id="levelGrid"></div>
+      <button id="levelsClose" class="mid blue">Close</button>
+    </div>
+  </div>
+
+  <!-- Win -->
+  <div id="win" class="screen modal-screen">
+    <div class="panel">
+      <h2 id="winTitle">Level Complete!</h2>
+      <div id="winStars" class="stars"></div>
+      <div class="reward"><span class="coin">🪙</span> <b id="winCoins">+20</b></div>
+      <button id="winNext" class="big green">Next</button>
+    </div>
+  </div>
+
+  <!-- Lose -->
+  <div id="lose" class="screen modal-screen">
+    <div class="panel">
+      <h2>Out of Space!</h2>
+      <div class="sad">🚌💨</div>
+      <p>All parking spots are full and nobody can board.</p>
+      <button id="loseSpot" class="big yellow"><span>🅿️ +1 Spot</span><small id="loseSpotPrice">🪙 60</small></button>
+      <button id="loseRetry" class="mid blue">↻ Try Again</button>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div id="settings" class="screen modal-screen">
+    <div class="panel">
+      <h2>Settings</h2>
+      <button id="soundToggle" class="mid blue">Sound: On</button>
+      <button id="restartBtn" class="mid yellow">↻ Restart Level</button>
+      <button id="homeBtn" class="mid purple">🏠 Home</button>
+      <button id="resetBtn" class="small ghost">Reset progress</button>
+      <button id="settingsClose" class="mid green">Done</button>
+    </div>
+  </div>
+
+  <!-- One-time tips -->
+  <div id="tip" class="screen modal-screen">
+    <div class="panel">
+      <h2>Tip</h2>
+      <p id="tipText"></p>
+      <button id="tipOk" class="mid green">Got it!</button>
+    </div>
+  </div>
+
+  <noscript>Please enable JavaScript to play.</noscript>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
