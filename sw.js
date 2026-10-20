@@ -1,5 +1,5 @@
 // Offline support: cache the whole game on first visit.
-const CACHE = 'busparty-v1';
+const CACHE = 'busparty-v2';
 const FILES = [
   './', './index.html', './manifest.webmanifest', './css/style.css',
   './js/main.js', './js/levels.js', './js/geom.js', './js/models.js', './js/audio.js',

@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+import * as THREE from './vendor/three.module.min.js';
 import { generateLevel, levelKind, COLORS, TYPES, MAX_LEVEL } from './levels.js';
 import { makeOBB, sweepDistance, roundedPath, makePath, samplePath, lerpAngle, dirVec } from './geom.js';
 import { buildVehicle, setVehicleColor, buildPassenger, makeLabel, buildWorld, computeLayout, MYSTERY_HEX } from './models.js';
@@ -881,9 +881,15 @@ ui.soundToggle.addEventListener('click', () => {
 });
 ui.restartBtn.addEventListener('click', () => { hide(ui.settings); startLevel(G.n); });
 ui.homeBtn.addEventListener('click', () => { hide(ui.settings); goHome(); });
+let resetArmed = false;
 ui.resetBtn.addEventListener('click', () => {
-  if (!confirm('Reset all progress, coins and boosters?')) return;
-  localStorage.removeItem(SAVE_KEY);
+  if (!resetArmed) {
+    resetArmed = true;
+    ui.resetBtn.textContent = 'Tap again to erase all progress';
+    setTimeout(() => { resetArmed = false; ui.resetBtn.textContent = 'Reset progress'; }, 3000);
+    return;
+  }
+  try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* ignore */ }
   location.reload();
 });
 ui.tipOk.addEventListener('click', () => hide(ui.tip));

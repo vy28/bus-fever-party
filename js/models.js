@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+import * as THREE from './vendor/three.module.min.js';
 import { RoundedBoxGeometry } from './vendor/RoundedBoxGeometry.js';
 import { TYPES } from './levels.js';
 
