@@ -3,8 +3,16 @@ let ctx = null;
 let master = null;
 let enabled = true;
 
+let musicOn = false;
+let musicTimer = null;
+
 export function setSoundEnabled(on) {
   enabled = on;
+}
+
+export function setMusicEnabled(on) {
+  musicOn = on;
+  if (on) startMusic(); else stopMusic();
 }
 
 export function unlockAudio() {
@@ -17,7 +25,55 @@ export function unlockAudio() {
     master.connect(ctx.destination);
   }
   if (ctx.state === 'suspended') ctx.resume();
+  if (musicOn) startMusic();
 }
+
+// Gentle original background loop: a bouncy bass line with a light melody on top.
+const BASS = [48, 48, 55, 55, 53, 53, 50, 55];
+const MELODY = [72, 76, 79, 76, 77, 74, 72, null, 72, 76, 79, 81, 79, 77, 76, null,
+  74, 77, 81, 77, 76, 72, 74, null, 71, 74, 79, 77, 76, 74, 72, null];
+let musicStep = 0;
+let nextNoteTime = 0;
+const BEAT = 0.2;
+function midi(n) { return 440 * Math.pow(2, (n - 69) / 12); }
+function musicNote(freq, t, dur, vol, type) {
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.type = type;
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g);
+  g.connect(master);
+  o.start(t);
+  o.stop(t + dur + 0.02);
+}
+function scheduleMusic() {
+  if (!ctx || !musicOn) return;
+  while (nextNoteTime < ctx.currentTime + 0.4) {
+    const i = musicStep % MELODY.length;
+    if (i % 2 === 0) musicNote(midi(BASS[(i / 2 >> 1) % BASS.length] - 12), nextNoteTime, BEAT * 1.6, 0.05, 'triangle');
+    const m = MELODY[i];
+    if (m) musicNote(midi(m), nextNoteTime, BEAT * 0.9, 0.025, 'sine');
+    nextNoteTime += BEAT;
+    musicStep++;
+  }
+}
+function startMusic() {
+  if (!ctx || musicTimer) return;
+  nextNoteTime = ctx.currentTime + 0.1;
+  musicTimer = setInterval(scheduleMusic, 100);
+}
+function stopMusic() {
+  clearInterval(musicTimer);
+  musicTimer = null;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!ctx) return;
+  if (document.hidden) ctx.suspend(); else ctx.resume();
+});
 
 function tone({ freq = 440, to = null, type = 'sine', dur = 0.15, vol = 0.3, delay = 0, attack = 0.005 }) {
   if (!enabled || !ctx) return;

@@ -385,17 +385,21 @@ function dash(group, mat, x, z, w, d) {
 export function computeLayout(level, maxSlots) {
   const hw = level.lotW / 2, hh = level.lotH / 2;
   const ro = 0.95; // ring road centre offset from lot edge
-  const bayW = 1.5;
+  const bayW = 1.34;
   const bayLen = 3.7;
   const ring = { x0: -hw - ro, x1: hw + ro, z0: -hh - ro, z1: hh + ro };
   const bayBottom = ring.z0 - 0.85;
   const bayTop = bayBottom - bayLen;
+  // Bays left to right: the VIP spot, then the regular spots. slotsX[maxSlots] is the VIP spot.
+  const nBays = maxSlots + 1;
+  const bayX = (k) => (k - (nBays - 1) / 2) * bayW;
   const slotsX = [];
-  for (let i = 0; i < maxSlots; i++) slotsX.push((i - (maxSlots - 1) / 2) * bayW);
+  for (let i = 0; i < maxSlots; i++) slotsX.push(bayX(i + 1));
+  slotsX.push(bayX(0));
   const exitZ = bayTop - 0.72;
   const queueHeadZ = exitZ - 1.05;
-  const queueHalfW = Math.max(hw + 0.4, (maxSlots * bayW) / 2 - 0.2);
-  return { hw, hh, ro, bayW, bayLen, ring, bayBottom, bayTop, slotsX, exitZ, queueHeadZ, queueHalfW };
+  const queueHalfW = Math.max(hw + 0.4, (nBays * bayW) / 2 - 0.2);
+  return { hw, hh, ro, bayW, bayLen, ring, bayBottom, bayTop, slotsX, nBays, vipSlot: maxSlots, exitZ, queueHeadZ, queueHalfW };
 }
 
 export function buildWorld(level, layout, maxSlots, seed) {
@@ -403,7 +407,7 @@ export function buildWorld(level, layout, maxSlots, seed) {
   let s = seed >>> 0;
   const rng = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
   const g = new THREE.Group();
-  const { hw, hh, ring, bayTop, bayBottom, slotsX, bayW, exitZ, queueHeadZ, queueHalfW } = layout;
+  const { hw, hh, ring, bayTop, bayBottom, slotsX, bayW, nBays, vipSlot, exitZ, queueHeadZ, queueHalfW } = layout;
 
   const grass = new THREE.Mesh(new THREE.PlaneGeometry(90, 90), new THREE.MeshStandardMaterial({ map: grassTex, roughness: 1 }));
   grass.rotation.x = -Math.PI / 2;
@@ -419,7 +423,7 @@ export function buildWorld(level, layout, maxSlots, seed) {
   // Ring road + bay apron as one slab.
   const rw = 1.35;
   const roadX0 = ring.x0 - rw / 2, roadX1 = ring.x1 + rw / 2;
-  const padHalf = Math.max(roadX1, (maxSlots * bayW) / 2 + 0.3);
+  const padHalf = Math.max(roadX1, (nBays * bayW) / 2 + 0.3);
   const road = new THREE.Mesh(rbox(roadX1 - roadX0, 0.04, ring.z1 + rw / 2 - (ring.z0 - rw / 2), 0.4, 2), asphalt);
   road.position.set(0, 0.02, (ring.z1 + rw / 2 + ring.z0 - rw / 2) / 2);
   road.receiveShadow = true;
@@ -461,11 +465,20 @@ export function buildWorld(level, layout, maxSlots, seed) {
   for (let x = -padHalf - 12; x < padHalf + 12; x += dashLen + gap) dash(g, yellowMat, x, exitZ, dashLen, 0.07);
 
   // Parking bays.
-  for (let i = 0; i <= maxSlots; i++) {
-    const x = (slotsX[0] ?? 0) - bayW / 2 + i * bayW;
+  for (let i = 0; i <= nBays; i++) {
+    const x = -(nBays * bayW) / 2 + i * bayW;
     dash(g, lineMat, x, (bayTop + bayBottom) / 2, 0.08, bayBottom - bayTop);
   }
-  dash(g, lineMat, 0, bayBottom, maxSlots * bayW + 0.08, 0.08);
+  dash(g, lineMat, 0, bayBottom, nBays * bayW + 0.08, 0.08);
+  // VIP spot: gold pad with a sign.
+  const vipMat = new THREE.MeshStandardMaterial({ color: 0xffc21a, roughness: 0.55, transparent: true, opacity: 0.55 });
+  const vipPad = new THREE.Mesh(box(bayW - 0.18, 0.012, bayBottom - bayTop - 0.16), vipMat);
+  vipPad.position.set(slotsX[vipSlot], 0.046, (bayTop + bayBottom) / 2);
+  vipPad.receiveShadow = true;
+  g.add(vipPad);
+  const vipSign = makeLabel('VIP', { w: 1.0, bg: 'rgba(255,194,26,0.97)', fg: '#5a3a00', size: 70, border: '#fff' });
+  vipSign.position.set(slotsX[vipSlot], 0.35, bayBottom + 0.05);
+  g.add(vipSign);
 
   // Sidewalk for the queue.
   const swDepth = 4.6;

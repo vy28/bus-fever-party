@@ -2,26 +2,59 @@ import * as THREE from './vendor/three.module.min.js';
 import { generateLevel, levelKind, COLORS, TYPES, MAX_LEVEL } from './levels.js';
 import { makeOBB, sweepDistance, roundedPath, makePath, samplePath, lerpAngle, dirVec } from './geom.js';
 import { buildVehicle, setVehicleColor, buildPassenger, makeLabel, buildWorld, computeLayout, MYSTERY_HEX } from './models.js';
-import { sfx, unlockAudio, setSoundEnabled } from './audio.js';
+import { sfx, unlockAudio, setSoundEnabled, setMusicEnabled } from './audio.js';
 
 // ---------------- Save data ----------------
-const SAVE_KEY = 'busparty-save-v1';
+// Economy: coins come only from winning levels (no ads, no purchases). Each level starts with
+// 4 regular spots; the 4 extra spots cost coins and reset when the level ends.
+const ECON = {
+  startCoins: 100,
+  reward: { normal: 20, hard: 40, super: 60 },
+  replayReward: 5,
+  price: { spot: 50, shuffle: 80, vip: 120 },
+  unlockLevel: { shuffle: 6, vip: 11 },
+  freeOnUnlock: 2,
+};
+const SAVE_KEY = 'busparty-save-v2';
 const save = loadSave();
 function loadSave() {
-  const def = { level: 1, coins: 150, boosters: { spot: 2, shuffle: 2, vip: 2 }, stars: {}, sound: true, seenTips: {} };
+  const def = {
+    level: 1, coins: ECON.startCoins, boosters: { shuffle: 0, vip: 0 }, unlocked: { shuffle: false, vip: false },
+    cleared: {}, sound: true, music: true, vibrate: true, seenTips: {},
+  };
   try {
     const s = JSON.parse(localStorage.getItem(SAVE_KEY));
-    if (s && typeof s === 'object') return { ...def, ...s, boosters: { ...def.boosters, ...s.boosters }, seenTips: { ...s.seenTips } };
+    if (s && typeof s === 'object') {
+      return { ...def, ...s, boosters: { ...def.boosters, ...s.boosters }, unlocked: { ...def.unlocked, ...s.unlocked },
+        cleared: { ...s.cleared }, seenTips: { ...s.seenTips } };
+    }
+    // Carry level and coins over from the first version of the game.
+    const old = JSON.parse(localStorage.getItem('busparty-save-v1'));
+    if (old && typeof old === 'object') {
+      def.level = Math.max(1, Math.min(MAX_LEVEL, old.level | 0 || 1));
+      def.coins = Math.max(0, old.coins | 0);
+      for (let i = 1; i < def.level; i++) def.cleared[i] = true;
+    }
   } catch (e) { /* ignore */ }
   return def;
 }
 function persist() {
   try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) { /* ignore */ }
 }
+function addCoins(n) {
+  save.coins = Math.max(0, save.coins + n);
+  persist();
+  ui.coinCount.textContent = save.coins;
+  ui.homeCoins.textContent = save.coins;
+}
 setSoundEnabled(save.sound);
+setMusicEnabled(save.music);
 
-const PRICES = { spot: 60, shuffle: 40, vip: 80 };
-const EXTRA_SLOTS = 2;
+const EXTRA_SLOTS = 4;
+const canVibrate = typeof navigator.vibrate === 'function';
+function buzz(ms) {
+  if (save.vibrate && canVibrate) try { navigator.vibrate(ms); } catch (e) { /* ignore */ }
+}
 
 // ---------------- Renderer & scene ----------------
 const canvas = document.getElementById('game');
@@ -54,9 +87,10 @@ let G = null; // current level runtime
 const raycaster = new THREE.Raycaster();
 const ui = {};
 for (const id of ['hud', 'levelLabel', 'levelBadge', 'coinCount', 'progressFill', 'boosters', 'toast', 'vipBanner',
-  'home', 'homeLevel', 'playBtn', 'levelsBtn', 'levels', 'levelGrid', 'levelsClose', 'win', 'winStars', 'winCoins',
-  'winNext', 'winTitle', 'lose', 'loseSpot', 'loseRetry', 'loseSpotPrice', 'settings', 'settingsBtn', 'soundToggle',
-  'settingsClose', 'restartBtn', 'homeBtn', 'resetBtn', 'tutorial', 'tutText', 'hand', 'homeCoins', 'confetti', 'tip', 'tipText', 'tipOk']) {
+  'home', 'homeLevel', 'playBtn', 'levelsBtn', 'levels', 'levelGrid', 'levelsClose', 'win', 'winCoins', 'winNote',
+  'winNext', 'winTitle', 'lose', 'loseSpot', 'loseRetry', 'loseSpotPrice', 'loseVip', 'loseVipPrice', 'settings', 'settingsBtn',
+  'soundToggle', 'musicToggle', 'vibeToggle', 'settingsClose', 'restartBtn', 'homeBtn', 'resetBtn', 'tutorial', 'tutText', 'hand',
+  'homeCoins', 'confetti', 'tip', 'tipTitle', 'tipText', 'tipOk', 'buy', 'buyTitle', 'buyText', 'buyOk', 'buyCancel', 'homeSettings']) {
   ui[id] = document.getElementById(id);
 }
 
@@ -136,7 +170,7 @@ function clearLevel() {
 function loadLevel(n) {
   clearLevel();
   const level = generateLevel(n);
-  const maxSlots = Math.min(level.slots + EXTRA_SLOTS, 7);
+  const maxSlots = level.slots + EXTRA_SLOTS;
   const layout = computeLayout(level, maxSlots);
   const root = new THREE.Group();
   scene.add(root);
@@ -145,14 +179,13 @@ function loadLevel(n) {
   G = {
     n, level, layout, root, maxSlots,
     unlocked: level.slots,
-    slots: new Array(maxSlots).fill(null),
+    slots: new Array(maxSlots + 1).fill(null), // last entry is the VIP spot
     vehicles: [],
     queue: [],
     walkers: [],
     boarded: 0,
     total: level.queue.length,
     tapCounter: 0,
-    boostersUsed: 0,
     state: 'playing',
     stuckT: 0,
     winT: 0,
@@ -208,7 +241,7 @@ function buildLockTiles() {
       new THREE.MeshStandardMaterial({ color: 0x3a3f4b, roughness: 0.8, transparent: true, opacity: 0.85 }));
     plate.position.y = 0.04;
     tile.add(plate);
-    const lbl = makeLabel('+', { w: 0.9, bg: 'rgba(255,200,40,0.95)', fg: '#5a3a00', size: 90, border: '#fff' });
+    const lbl = makeLabel(`+ 🪙${ECON.price.spot}`, { w: 1.25, bg: 'rgba(255,200,40,0.97)', fg: '#5a3a00', size: 58, border: '#fff' });
     lbl.position.y = 0.7;
     tile.add(lbl);
     tile.position.set(L.slotsX[i], 0, (L.bayTop + L.bayBottom) / 2);
@@ -416,10 +449,12 @@ function tapVehicle(v) {
   hideTutorialHand();
   const slot = freeSlot();
   if (G.vip) {
-    if (slot < 0) { toast('No free parking spot!'); sfx.error(); return; }
-    G.vip = false;
-    ui.vipBanner.classList.remove('show');
-    flyToSlot(v, slot);
+    const vs = G.layout.vipSlot;
+    if (G.slots[vs]) { toast('The VIP spot is busy'); sfx.error(); return; }
+    if (!payFor('vip')) { cancelVip(); return; }
+    cancelVip();
+    flyToSlot(v, vs);
+    updateHud();
     return;
   }
   const info = blockInfo(v);
@@ -430,7 +465,7 @@ function tapVehicle(v) {
     return;
   }
   if (slot < 0) {
-    toast('All parking spots are full!');
+    toast('No spots available!');
     v.shake = 1;
     sfx.error();
     return;
@@ -494,6 +529,7 @@ function updateVehicles(dt) {
           b.phase = 'back';
           b.t = 0;
           sfx.bump();
+          buzz(30);
           if (b.hit) b.hit.shake = 1;
           v.shake = 0.6;
           if (!G.honked || G.time - G.honked > 0.6) { sfx.honk(); G.honked = G.time; }
@@ -635,7 +671,7 @@ function checkEnd(dt) {
     if (G.winT > 0.9) win();
     return;
   }
-  if (busy || !G.queue.length) { G.stuckT = 0; return; }
+  if (busy || !G.queue.length || G.vip) { G.stuckT = 0; return; }
   if (freeSlot() >= 0) { G.stuckT = 0; return; }
   const c = G.queue[0].color;
   const canBoard = G.vehicles.some((v) => v.state === 'parked' && v.color === c && v.filled + v.incoming < v.seats);
@@ -644,23 +680,20 @@ function checkEnd(dt) {
   if (G.stuckT > 0.7) lose();
 }
 
-function starsFor() {
-  return G.boostersUsed === 0 ? 3 : G.boostersUsed <= 2 ? 2 : 1;
-}
-
 function win() {
+  if (G.state === 'won') return;
   G.state = 'won';
-  const stars = starsFor();
   const kind = levelKind(G.n);
-  const reward = 10 + stars * 5 + (kind === 'hard' ? 15 : kind === 'super' ? 30 : 0);
-  save.coins += reward;
-  save.stars[G.n] = Math.max(save.stars[G.n] || 0, stars);
+  const first = !save.cleared[G.n];
+  const reward = first ? ECON.reward[kind] : ECON.replayReward;
+  save.cleared[G.n] = true;
   if (G.n === save.level && save.level < MAX_LEVEL) save.level = G.n + 1;
-  persist();
+  addCoins(reward);
   sfx.win();
-  ui.winTitle.textContent = kind === 'normal' ? 'Level Complete!' : kind === 'hard' ? 'Hard Level Beaten!' : 'Super Hard Beaten!';
-  ui.winStars.innerHTML = [1, 2, 3].map((i) => `<span class="star ${i <= stars ? 'on' : ''}" style="animation-delay:${0.15 + i * 0.18}s">★</span>`).join('');
+  buzz([40, 60, 40]);
+  ui.winTitle.textContent = kind === 'normal' ? 'Level Complete!' : kind === 'hard' ? 'Hard Level Complete!' : 'Super Hard Complete!';
   ui.winCoins.textContent = `+${reward}`;
+  ui.winNote.textContent = first ? '' : 'Replayed level';
   ui.winNext.textContent = G.n >= MAX_LEVEL ? 'Play Again' : `Level ${Math.min(G.n + 1, MAX_LEVEL)}`;
   setTimeout(() => { show(ui.win); confetti(); updateHud(); }, 250);
 }
@@ -668,62 +701,121 @@ function win() {
 function lose() {
   G.state = 'lost';
   sfx.lose();
-  const can = G.unlocked < G.maxSlots;
-  ui.loseSpot.style.display = can ? '' : 'none';
-  ui.loseSpotPrice.textContent = save.boosters.spot > 0 ? `Use 1 (${save.boosters.spot} left)` : `🪙 ${PRICES.spot}`;
+  buzz(200);
+  const canSpot = G.unlocked < G.maxSlots;
+  ui.loseSpot.style.display = canSpot ? '' : 'none';
+  ui.loseSpotPrice.textContent = `🪙 ${ECON.price.spot}`;
+  const canVip = save.unlocked.vip && !G.slots[G.layout.vipSlot];
+  ui.loseVip.style.display = canVip ? '' : 'none';
+  ui.loseVipPrice.textContent = save.boosters.vip > 0 ? `Free (${save.boosters.vip} left)` : `🪙 ${ECON.price.vip}`;
   show(ui.lose);
 }
 
-// ---------------- Boosters ----------------
-function spendBooster(kind) {
-  if (save.boosters[kind] > 0) { save.boosters[kind]--; persist(); return true; }
-  if (save.coins >= PRICES[kind]) { save.coins -= PRICES[kind]; persist(); sfx.coin(); return true; }
-  toast(`Not enough coins (need ${PRICES[kind]})`);
-  sfx.error();
-  return false;
+// ---------------- Boosters & purchases ----------------
+// Uses a free booster if there is one, otherwise takes coins. Returns false if neither.
+function payFor(kind) {
+  if (kind !== 'spot' && save.boosters[kind] > 0) { save.boosters[kind]--; persist(); return true; }
+  const price = ECON.price[kind];
+  if (save.coins < price) return false;
+  addCoins(-price);
+  sfx.coin();
+  return true;
+}
+function costText(kind) {
+  if (kind !== 'spot' && save.boosters[kind] > 0) return `free (${save.boosters[kind]} left)`;
+  return `🪙 ${ECON.price[kind]}`;
+}
+function canAfford(kind) {
+  return (kind !== 'spot' && save.boosters[kind] > 0) || save.coins >= ECON.price[kind];
 }
 
-function useBooster(kind) {
+let buyAction = null;
+function askToBuy(title, text, action) {
+  ui.buyTitle.textContent = title;
+  ui.buyText.textContent = text;
+  buyAction = action;
+  show(ui.buy);
+}
+ui.buyOk.addEventListener('click', () => { hide(ui.buy); const a = buyAction; buyAction = null; if (a) a(); });
+ui.buyCancel.addEventListener('click', () => { hide(ui.buy); buyAction = null; });
+function notEnough(kind) {
+  askToBuy('Not enough coins', `This costs 🪙 ${ECON.price[kind]} and you have 🪙 ${save.coins}. Win levels to earn more coins.`, null);
+  ui.buyOk.textContent = 'OK';
+}
+
+const NAMES = { spot: 'Extra Spot', shuffle: 'Shuffle', vip: 'VIP' };
+const INFO = {
+  spot: 'Opens one more parking spot for this level.',
+  shuffle: 'Mixes up the colors of every vehicle still in the parking lot.',
+  vip: 'Lifts any vehicle, even a blocked one, into the VIP spot.',
+};
+
+function requestBooster(kind) {
   if (!G || G.state !== 'playing') return;
   hideTutorialHand();
+  if (kind !== 'spot' && !save.unlocked[kind]) { toast(`Unlocks at level ${ECON.unlockLevel[kind]}`); return; }
+  if (kind === 'vip' && G.vip) { cancelVip(); toast('VIP cancelled'); return; }
+  if (kind === 'spot' && G.unlocked >= G.maxSlots) { toast('All extra spots are open'); return; }
+  if (kind === 'shuffle' && G.vehicles.filter((v) => v.state === 'lot').length < 2) { toast('Nothing left to shuffle'); return; }
+  if (kind === 'vip' && G.slots[G.layout.vipSlot]) { toast('The VIP spot is busy'); return; }
+  if (!canAfford(kind)) { notEnough(kind); return; }
+  const go = () => applyBooster(kind);
+  if (kind !== 'spot' && save.boosters[kind] > 0) { go(); return; }
+  ui.buyOk.textContent = `Buy 🪙 ${ECON.price[kind]}`;
+  askToBuy(NAMES[kind], INFO[kind], go);
+}
+
+function applyBooster(kind) {
+  if (!G || (G.state !== 'playing' && !(kind === 'spot' && G.state === 'lost'))) return;
   if (kind === 'spot') {
-    if (G.unlocked >= G.maxSlots) { toast('All extra spots are open!'); return; }
-    if (!spendBooster('spot')) return;
+    if (G.unlocked >= G.maxSlots || !payFor('spot')) return;
     unlockSlot();
+    if (G.state === 'lost') { G.state = 'playing'; hide(ui.lose); }
   } else if (kind === 'shuffle') {
-    const lot = G.vehicles.filter((v) => v.state === 'lot');
-    if (lot.length < 2) { toast('Nothing to shuffle'); return; }
-    if (!spendBooster('shuffle')) return;
-    for (const type of Object.keys(TYPES)) {
-      const group = lot.filter((v) => v.type === type);
-      const cols = group.map((v) => v.color);
-      for (let i = cols.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [cols[i], cols[j]] = [cols[j], cols[i]];
-      }
-      group.forEach((v, i) => {
-        if (v.color === cols[i]) return;
-        const from = new THREE.Color(v.m.paint.color.getHex());
-        v.color = cols[i];
-        if (!v.mystery) { v.revealT = 0; v.revealFrom = from; }
-      });
-    }
+    if (!payFor('shuffle')) return;
+    shuffleLot();
   } else if (kind === 'vip') {
-    if (G.vip) return;
-    if (freeSlot() < 0) { toast('Free a spot first (try +Spot)'); return; }
-    if (!spendBooster('vip')) return;
+    // Paid when the vehicle is picked, so cancelling costs nothing.
     G.vip = true;
     ui.vipBanner.classList.add('show');
+    ui.boosters.querySelector('[data-booster="vip"]').classList.add('active');
   }
-  G.boostersUsed++;
   sfx.booster();
   updateHud();
+}
+
+function cancelVip() {
+  G.vip = false;
+  ui.vipBanner.classList.remove('show');
+  ui.boosters.querySelector('[data-booster="vip"]').classList.remove('active');
+}
+
+function shuffleLot() {
+  const lot = G.vehicles.filter((v) => v.state === 'lot');
+  // Colors only swap between vehicles of the same size, so every color keeps its seat count.
+  for (const type of Object.keys(TYPES)) {
+    const group = lot.filter((v) => v.type === type);
+    const cols = group.map((v) => v.color);
+    for (let i = cols.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [cols[i], cols[j]] = [cols[j], cols[i]];
+    }
+    group.forEach((v, i) => {
+      v.bounce = 1;
+      v.shake = 0.6;
+      if (v.color === cols[i]) return;
+      const from = new THREE.Color(v.m.paint.color.getHex());
+      v.color = cols[i];
+      if (!v.mystery) { v.revealT = 0; v.revealFrom = from; }
+    });
+  }
 }
 
 function unlockSlot() {
   G.unlocked++;
   buildLockTiles();
   G.stuckT = 0;
+  updateHud();
 }
 
 // ---------------- HUD / UI ----------------
@@ -737,9 +829,19 @@ function updateHud() {
   ui.homeCoins.textContent = save.coins;
   for (const btn of ui.boosters.querySelectorAll('[data-booster]')) {
     const k = btn.dataset.booster;
+    const count = btn.querySelector('.count');
+    if (k === 'spot') {
+      const full = G.unlocked >= G.maxSlots;
+      count.textContent = full ? 'MAX' : `🪙${ECON.price.spot}`;
+      count.className = full ? 'count lock' : 'count price';
+      continue;
+    }
+    const locked = !save.unlocked[k];
+    btn.classList.toggle('locked', locked);
+    if (locked) { count.textContent = `Lv ${ECON.unlockLevel[k]}`; count.className = 'count lock'; continue; }
     const c = save.boosters[k];
-    btn.querySelector('.count').textContent = c > 0 ? c : `🪙${PRICES[k]}`;
-    btn.querySelector('.count').classList.toggle('price', c <= 0);
+    count.textContent = c > 0 ? c : `🪙${ECON.price[k]}`;
+    count.className = c > 0 ? 'count' : 'count price';
   }
   updateProgress();
 }
@@ -790,16 +892,22 @@ function showTutorial() {
     ui.tutText.textContent = 'Buses only drive the way their arrow points. Clear the way first!';
     ui.tutorial.classList.add('show');
     G.hintOn = true;
+  } else if (G.n === 3) {
+    ui.tutText.textContent = `Need more room? Tap a yellow locked spot to open it for 🪙${ECON.price.spot} (this level only).`;
+    ui.tutorial.classList.add('show');
+    G.hintOn = false;
   } else G.hintOn = false;
-  if (G.n >= 8 && G.level.vehicles.some((v) => v.mystery) && !save.seenTips.mystery) {
+  if (G.level.vehicles.some((v) => v.mystery) && !save.seenTips.mystery) {
     save.seenTips.mystery = true;
     persist();
-    ui.tipText.textContent = 'New! Grey “?” vehicles hide their color until their path is clear.';
+    ui.tipTitle.textContent = 'New: “?” vehicles';
+    ui.tipText.textContent = 'Grey “?” vehicles hide their color until nothing is blocking their way out.';
     show(ui.tip);
   } else if (levelKind(G.n) !== 'normal' && !save.seenTips.hard) {
     save.seenTips.hard = true;
     persist();
-    ui.tipText.textContent = 'Hard level! Fewer spare parking spots — plan your moves.';
+    ui.tipTitle.textContent = 'Hard level!';
+    ui.tipText.textContent = 'There is less room for mistakes. Watch the line of passengers and plan your moves.';
     show(ui.tip);
   }
 }
@@ -836,14 +944,14 @@ canvas.addEventListener('pointerup', (e) => {
   if (!hits.length) return;
   const o = hits[0].object;
   if (o.userData.vehicle) tapVehicle(o.userData.vehicle);
-  else if (o.userData.lockedSlot !== undefined) useBooster('spot');
+  else if (o.userData.lockedSlot !== undefined) requestBooster('spot');
 });
 
 ui.boosters.addEventListener('click', (e) => {
   const b = e.target.closest('[data-booster]');
   if (!b) return;
   unlockAudio();
-  useBooster(b.dataset.booster);
+  requestBooster(b.dataset.booster);
 });
 
 ui.playBtn.addEventListener('click', () => {
@@ -862,13 +970,15 @@ ui.winNext.addEventListener('click', () => {
 });
 ui.loseRetry.addEventListener('click', () => { sfx.tap(); hide(ui.lose); startLevel(G.n); });
 ui.loseSpot.addEventListener('click', () => {
-  if (!spendBooster('spot')) return;
-  G.boostersUsed++;
-  unlockSlot();
+  if (save.coins < ECON.price.spot) { notEnough('spot'); return; }
+  applyBooster('spot');
+});
+ui.loseVip.addEventListener('click', () => {
+  if (!canAfford('vip')) { notEnough('vip'); return; }
   hide(ui.lose);
   G.state = 'playing';
-  sfx.booster();
-  updateHud();
+  G.stuckT = -2; // give the player time to pick a vehicle
+  applyBooster('vip');
 });
 ui.settingsBtn.addEventListener('click', () => { sfx.tap(); renderSettings(); show(ui.settings); });
 ui.settingsClose.addEventListener('click', () => hide(ui.settings));
@@ -879,6 +989,20 @@ ui.soundToggle.addEventListener('click', () => {
   renderSettings();
   sfx.tap();
 });
+ui.musicToggle.addEventListener('click', () => {
+  unlockAudio();
+  save.music = !save.music;
+  setMusicEnabled(save.music);
+  persist();
+  renderSettings();
+});
+ui.vibeToggle.addEventListener('click', () => {
+  save.vibrate = !save.vibrate;
+  persist();
+  renderSettings();
+  buzz(30);
+});
+ui.homeSettings.addEventListener('click', () => { unlockAudio(); sfx.tap(); renderSettings(); show(ui.settings); });
 ui.restartBtn.addEventListener('click', () => { hide(ui.settings); startLevel(G.n); });
 ui.homeBtn.addEventListener('click', () => { hide(ui.settings); goHome(); });
 let resetArmed = false;
@@ -896,16 +1020,37 @@ ui.tipOk.addEventListener('click', () => hide(ui.tip));
 
 function renderSettings() {
   ui.soundToggle.textContent = save.sound ? 'Sound: On 🔊' : 'Sound: Off 🔇';
+  ui.musicToggle.textContent = save.music ? 'Music: On 🎵' : 'Music: Off';
+  ui.vibeToggle.textContent = save.vibrate ? 'Vibration: On 📳' : 'Vibration: Off';
+  ui.vibeToggle.style.display = canVibrate ? '' : 'none';
   ui.restartBtn.style.display = ui.hud.classList.contains('show') ? '' : 'none';
   ui.homeBtn.style.display = ui.hud.classList.contains('show') ? '' : 'none';
 }
 
 function startLevel(n) {
-  hide(ui.win); hide(ui.lose); hide(ui.levels); hide(ui.home);
+  hide(ui.win); hide(ui.lose); hide(ui.levels); hide(ui.home); hide(ui.buy);
   ui.hud.classList.add('show');
   ui.vipBanner.classList.remove('show');
+  ui.boosters.querySelector('[data-booster="vip"]').classList.remove('active');
   boardTimer = 0;
   loadLevel(n);
+  checkBoosterUnlocks();
+}
+
+// New boosters unlock at set levels and come with free uses.
+function checkBoosterUnlocks() {
+  for (const k of ['shuffle', 'vip']) {
+    if (!save.unlocked[k] && G.n >= ECON.unlockLevel[k]) {
+      save.unlocked[k] = true;
+      save.boosters[k] += ECON.freeOnUnlock;
+      persist();
+      ui.tipTitle.textContent = `New booster: ${NAMES[k]}!`;
+      ui.tipText.textContent = `${INFO[k]} Here are ${ECON.freeOnUnlock} free ones to try.`;
+      show(ui.tip);
+      updateHud();
+      return;
+    }
+  }
 }
 
 function goHome() {
@@ -928,8 +1073,8 @@ function openLevels() {
     const kind = levelKind(i);
     const locked = i > save.level;
     b.className = `lvl ${kind} ${locked ? 'locked' : ''} ${i === save.level ? 'current' : ''}`;
-    const st = save.stars[i] || 0;
-    b.innerHTML = `<span class="num">${locked ? '🔒' : i}</span><span class="st">${locked ? '' : '★'.repeat(st) + '<em>' + '★'.repeat(3 - st) + '</em>'}</span>`;
+    const tag = kind === 'hard' ? 'HARD' : kind === 'super' ? 'SUPER' : save.cleared[i] ? '✓' : '';
+    b.innerHTML = `<span class="num">${locked ? '🔒' : i}</span><span class="st">${locked ? '' : tag}</span>`;
     if (!locked) b.addEventListener('click', () => { sfx.tap(); startLevel(i); });
     frag.appendChild(b);
   }
@@ -965,7 +1110,7 @@ requestAnimationFrame(frame);
 
 // Test hooks used by the automated play-tester.
 window.__bp = {
-  get G() { return G; }, tapVehicle, useBooster, startLevel, blockInfo, freeSlot, save,
+  get G() { return G; }, tapVehicle, requestBooster, applyBooster, startLevel, blockInfo, freeSlot, save, ECON,
   step(dt) { G.time += dt; updateVehicles(dt); updateBoarding(dt); updateQueue(dt); checkEnd(dt); },
 };
 

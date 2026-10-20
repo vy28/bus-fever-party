@@ -8,9 +8,17 @@ It's an original take on the gameplay; all the art is built in code with Three.j
 - Vehicles that get out take a parking spot at the top. Passengers whose color matches climb on.
 - When a vehicle is full, it leaves and frees its spot.
 - If every spot is full and nobody at the front of the line can board, you're out of space.
-- Grey "?" vehicles show their color once nothing blocks their path.
-- Boosters: **+Spot** opens an extra parking spot, **Shuffle** mixes the colors of the vehicles still on the lot, and **VIP Lift** flies any vehicle straight to a spot.
-- There are 500 levels. Every 5th is *Hard* and every 20th is *Super Hard*. The generator makes sure every level can be solved.
+- Grey "?" vehicles (from level 10) show their color once nothing blocks their path.
+- There are 500 levels. Hard levels start at 9 and come every 5 levels (9, 14, 19…). Every 10th level from 20 is *Super Hard*. The generator makes sure every level can be solved with just the 4 free spots.
+
+## Parking spots, boosters and coins
+- Every level starts with **4 parking spots**. The 4 extra spots (yellow, locked) cost **50 coins each** and only last for that level.
+- The **VIP spot** (gold, on the left) is only used by the VIP booster.
+- **Shuffle** unlocks at level 6 and **VIP** at level 11. Each comes with 2 free uses, then costs coins (Shuffle 80, VIP 120).
+  - Shuffle mixes the colors of the vehicles still in the lot. Colors only swap between vehicles of the same size, so every color keeps its seat count.
+  - VIP lifts any vehicle, even a blocked one, into the VIP spot. You only pay when you pick the vehicle, so tapping VIP again to cancel is free.
+- Coins come from winning: **+20** for a normal level, **+40** Hard, **+60** Super Hard, and +5 for replaying a level you've already beaten. You start with 100. There are no ads and no purchases.
+- When you run out of space you can **+1 Spot** (50 coins), **Use VIP**, or **Try Again** for free.
 
 ## Put it on an iPhone home screen
 1. Open the game's URL in **Safari**.

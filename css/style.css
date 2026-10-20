@@ -59,6 +59,12 @@ button { font-family: inherit; cursor: pointer; border: 0; }
   border: 3px solid #fff;
 }
 .boosters .count.price { background: #ffb400; font-size: 12px; }
+.boosters .count.lock { background: #8b93a5; font-size: 11px; }
+.boosters button.locked .ico, .boosters button.locked .name { opacity: .4; filter: grayscale(1); }
+.boosters button.active { background: linear-gradient(#fff3c4, #ffd84a); box-shadow: 0 5px 0 #c98600, 0 0 0 4px #ffcc1f; }
+.trophy { font-size: 72px; line-height: 1; animation: starIn .5s cubic-bezier(.2,1.8,.4,1); }
+.note { font-size: 14px !important; color: #8b93a5 !important; min-height: 0; }
+.note:empty { display: none; }
 
 #toast {
   position: fixed; left: 50%; top: calc(var(--sat) + 110px); transform: translate(-50%, -20px); opacity: 0;

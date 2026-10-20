@@ -39,40 +39,46 @@ function shuffle(arr, rng) {
   return arr;
 }
 
+// Hard levels start at 9 and come every 5 levels; every 10th level from 20 is Super Hard.
 export function levelKind(n) {
-  if (n >= 20 && n % 20 === 0) return 'super';
-  if (n >= 6 && n % 5 === 0) return 'hard';
+  if (n >= 20 && n % 10 === 0) return 'super';
+  if (n >= 9 && n % 5 === 4) return 'hard';
   return 'normal';
 }
 
+// Every level starts with 4 regular parking spots (extra locked spots are opened in-game).
+// `buffer` is how many spots the intended solution leaves spare.
+export const BASE_SLOTS = 4;
+
 export function levelParams(n) {
   const kind = levelKind(n);
-  let vehicles, colors, slots, buffer, stick, mystery, diag;
+  const slots = BASE_SLOTS;
+  let vehicles, colors, buffer, stick, mystery, diag;
   if (n === 1) {
-    vehicles = 4; colors = 2; slots = 4; buffer = 3; stick = 1; mystery = 0; diag = false;
+    vehicles = 4; colors = 2; buffer = 2; stick = 1; mystery = 0; diag = false;
   } else if (n === 2) {
-    vehicles = 7; colors = 3; slots = 5; buffer = 3; stick = 0.9; mystery = 0; diag = false;
+    vehicles = 7; colors = 3; buffer = 2; stick = 0.9; mystery = 0; diag = false;
   } else if (n === 3) {
-    vehicles = 10; colors = 3; slots = 5; buffer = 3; stick = 0.85; mystery = 0; diag = true;
+    vehicles = 10; colors = 3; buffer = 2; stick = 0.85; mystery = 0; diag = true;
   } else {
-    vehicles = Math.round(Math.min(12 + n * 0.45, 26));
-    colors = Math.min(3 + Math.floor(n / 5), 8);
-    slots = 6;
-    buffer = n < 12 ? 3 : n < 40 ? 2 : 2 - (n % 3 === 0 ? 1 : 0);
+    vehicles = Math.round(Math.min(12 + n * 0.6, 30));
+    colors = Math.min(3 + Math.floor(n / 6), 8);
+    buffer = n < 15 ? 2 : n % 2 === 0 ? 1 : 2;
     stick = Math.max(0.45, 0.85 - n * 0.008);
-    mystery = n < 8 ? 0 : Math.min(0.08 + n * 0.003, 0.3);
+    // "?" vehicles arrive at level 10.
+    mystery = n < 10 ? 0 : Math.min(0.1 + n * 0.003, 0.3);
     diag = true;
   }
-  if (kind === 'hard') { vehicles = Math.round(vehicles * 1.15); slots = 5; buffer = Math.max(1, buffer - 1); stick -= 0.1; }
-  if (kind === 'super') { vehicles = Math.round(vehicles * 1.3); slots = 5; buffer = 1; stick -= 0.15; mystery += 0.1; }
-  vehicles = Math.min(vehicles, 30);
+  if (kind === 'hard') { vehicles = Math.round(vehicles * 1.2); buffer = 1; stick -= 0.1; colors = Math.min(colors + 1, 8); }
+  if (kind === 'super') { vehicles = Math.round(vehicles * 1.35); buffer = 1; stick -= 0.15; mystery += 0.1; colors = Math.min(colors + 1, 8); }
+  vehicles = Math.min(vehicles, 36);
   return { n, kind, vehicles, colors, slots, buffer, stick, mystery, diag };
 }
 
 function lotSize(target) {
   const area = target * 3.3 + 12;
-  const w = Math.max(6.5, Math.min(9.6, Math.sqrt(area * 0.78)));
-  const h = Math.max(6.5, Math.min(12.5, area / w));
+  const w = Math.max(6.5, Math.min(10.5, Math.sqrt(area * 0.78)));
+  const h = Math.max(6.5, Math.min(13.5, area / w));
   return { w: Math.round(w * 2) / 2, h: Math.round(h * 2) / 2 };
 }
 
@@ -116,12 +122,12 @@ function tryGenerate(n, p, salt) {
     return o;
   };
   let misses = 0;
-  while (placed.length < p.vehicles && misses < 3) {
+  while (placed.length < p.vehicles && misses < 6) {
     let best = null;
     let bestScore = Infinity;
     const first = pickType(rng, n);
     for (const type of [first, 'van', 'car']) {
-      for (let k = 0; k < 260; k++) {
+      for (let k = 0; k < 700; k++) {
         const x = Math.round(((rng() - 0.5) * w) / snap) * snap;
         const z = Math.round(((rng() - 0.5) * h) / snap) * snap;
         let d = dirs[Math.floor(rng() * dirs.length)];
