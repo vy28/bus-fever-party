@@ -1,4 +1,5 @@
 import { makeOBB, overlaps, sweepDistance, extents } from './geom.js';
+import { buildTrack, trackStyle, makeRing, cellAt, PER_RANK } from './track.js';
 
 export const COLORS = [
   { name: 'red', hex: 0xff4a4a },
@@ -12,13 +13,15 @@ export const COLORS = [
 ];
 
 export const TYPES = {
-  car: { len: 1.75, wid: 0.98, seats: 4 },
-  van: { len: 2.35, wid: 1.04, seats: 6 },
-  bus: { len: 3.15, wid: 1.08, seats: 10 },
+  car: { len: 1.36, wid: 0.9, seats: 4 },
+  van: { len: 1.86, wid: 0.94, seats: 8 },
+  bus: { len: 2.5, wid: 0.98, seats: 12 },
 };
+// Half the width of the parking row (VIP + 4 spots + 3 locked); the track shares it.
+export const ROW_HALF_W = 5.0;
 
 export const MAX_LEVEL = 500;
-const GAP = 0.1;
+const GAP = 0.08;
 
 export function mulberry32(seed) {
   let a = seed >>> 0;
@@ -59,26 +62,27 @@ export function levelParams(n) {
   } else if (n === 2) {
     vehicles = 7; colors = 3; buffer = 2; stick = 0.9; mystery = 0; diag = false;
   } else if (n === 3) {
-    vehicles = 10; colors = 3; buffer = 2; stick = 0.85; mystery = 0; diag = true;
+    vehicles = 10; colors = 3; buffer = 2; stick = 0.85; mystery = 0; diag = false;
   } else {
-    vehicles = Math.round(Math.min(12 + n * 0.6, 30));
+    vehicles = Math.round(Math.min(12 + n * 0.75, 58));
     colors = Math.min(3 + Math.floor(n / 6), 8);
     buffer = n < 15 ? 2 : n % 2 === 0 ? 1 : 2;
     stick = Math.max(0.45, 0.85 - n * 0.008);
     // "?" vehicles arrive at level 10.
     mystery = n < 10 ? 0 : Math.min(0.1 + n * 0.003, 0.3);
-    diag = true;
+    diag = false;
   }
   if (kind === 'hard') { vehicles = Math.round(vehicles * 1.2); buffer = 1; stick -= 0.1; colors = Math.min(colors + 1, 8); }
   if (kind === 'super') { vehicles = Math.round(vehicles * 1.35); buffer = 1; stick -= 0.15; mystery += 0.1; colors = Math.min(colors + 1, 8); }
-  vehicles = Math.min(vehicles, 36);
-  return { n, kind, vehicles, colors, slots, buffer, stick, mystery, diag };
+  vehicles = Math.min(vehicles, 64);
+  const dig = n < 6 ? 0 : Math.min(0.85, (n < 15 ? 0.45 : 0.65) + (kind === 'normal' ? 0 : 0.15));
+  return { n, kind, vehicles, colors, slots, buffer, stick, mystery, diag, dig };
 }
 
 function lotSize(target) {
-  const area = target * 3.3 + 12;
-  const w = Math.max(6.5, Math.min(10.5, Math.sqrt(area * 0.78)));
-  const h = Math.max(6.5, Math.min(13.5, area / w));
+  const area = target * 2.3 + 8;
+  const w = Math.max(5.5, Math.min(9.8, Math.sqrt(area * 0.8)));
+  const h = Math.max(5.5, Math.min(12.5, area / w));
   return { w: Math.round(w * 2) / 2, h: Math.round(h * 2) / 2 };
 }
 
@@ -142,11 +146,22 @@ function tryGenerate(n, p, salt) {
     if (best) { placed.push(best); misses = 0; } else misses++;
   }
 
-  // Colours: guarantee every colour shows up at least once when possible.
+  // Colors: vehicles that leave around the same time often share a color, which is what
+  // gives the waiting crowd its long single-color blocks. Every color shows up at least once.
   const nColors = Math.min(p.colors, placed.length);
   const palette = shuffle(COLORS.map((_, i) => i), rng).slice(0, nColors);
-  const colorIdx = placed.map((_, i) => (i < nColors ? palette[i] : palette[Math.floor(rng() * nColors)]));
-  shuffle(colorIdx, rng);
+  const colorIdx = new Array(placed.length);
+  let unused = palette.slice();
+  let prev = -1;
+  for (let e = 0; e < placed.length;) {
+    let c;
+    if (unused.length && rng() < 0.6) c = unused.splice(Math.floor(rng() * unused.length), 1)[0];
+    else { do { c = palette[Math.floor(rng() * nColors)]; } while (nColors > 1 && c === prev); }
+    unused = unused.filter((u) => u !== c);
+    const run = n < 10 ? 1 + Math.floor(rng() * 2) : 3 + Math.floor(rng() * 3);
+    for (let k = 0; k < run && e < placed.length; k++, e++) colorIdx[placed.length - 1 - e] = c;
+    prev = c;
+  }
 
   const vehicles = placed.map((v, i) => ({
     id: i,
@@ -166,33 +181,27 @@ function tryGenerate(n, p, salt) {
     });
   }
 
-  // Passenger queue: replay the escape order while keeping at most `open` vehicles
-  // parked, which leaves `buffer` spare bays for the player's mistakes.
+  // Passenger stream: replay the escape order while keeping at most `open` vehicles
+  // parked, which leaves `buffer` spare spots for the player's mistakes.
   const escape = vehicles.slice().reverse();
-  const openLimit = Math.max(1, p.slots - p.buffer);
-  const open = [];
-  let next = 0;
-  const queue = [];
-  while (open.length < openLimit && next < escape.length) {
-    const v = escape[next++];
-    open.push({ v, rem: TYPES[v.type].seats });
+  const style = trackStyle(n);
+  const track = buildTrack(style, { x: 0, z: 0 }, ROW_HALF_W, -4);
+  // The loop starts packed and the rest of the crowd waits in the arms. If the check finds
+  // a deadlock, leave gaps on the loop (so the arms keep flowing) and allow one more parked
+  // vehicle, then try again.
+  const total = escape.reduce((a, v) => a + TYPES[v.type].seats, 0);
+  let setup = null;
+  for (let tryNo = 0; tryNo < 8 && !setup; tryNo++) {
+    const openLimit = Math.max(1, Math.min(p.slots, p.slots - p.buffer + (tryNo >= 4 ? 1 : 0)));
+    const stream = makeStream(escape, openLimit, p.stick - (tryNo % 4) * 0.05, rng, p.dig);
+    const onLoop = Math.round(track.ranks * PER_RANK * (1 - (tryNo % 4) * 0.15));
+    const start = placeStream(stream, track, style.arms, onLoop);
+    if (simulate(start, track, escape, openLimit)) { setup = start; setup.tries = tryNo; }
   }
-  let last = -1;
-  while (open.length) {
-    let color;
-    if (last >= 0 && open.some((o) => o.v.color === last) && rng() < p.stick) color = last;
-    else color = open[Math.floor(rng() * open.length)].v.color;
-    const target = open.find((o) => o.v.color === color);
-    target.rem--;
-    queue.push(color);
-    last = color;
-    if (target.rem === 0) {
-      open.splice(open.indexOf(target), 1);
-      if (next < escape.length) {
-        const v = escape[next++];
-        open.push({ v, rem: TYPES[v.type].seats });
-      }
-    }
+  if (!setup) {
+    const stream = makeStream(escape, p.slots, 0.5, rng);
+    setup = placeStream(stream, track, style.arms, Math.round(track.ranks * PER_RANK * 0.5));
+    setup.tries = 99;
   }
 
   // Shrink the lot to hug the jam so smaller levels don't float in empty asphalt.
@@ -204,5 +213,109 @@ function tryGenerate(n, p, salt) {
   }
   const lotW = Math.min(w, Math.max(5.5, Math.ceil((mx + 0.35) * 4) / 2));
   const lotH = Math.min(h, Math.max(5.5, Math.ceil((mz + 0.35) * 4) / 2));
-  return { n, kind: p.kind, lotW, lotH, slots: p.slots, buffer: p.buffer, vehicles, queue };
+  return { n, kind: p.kind, lotW, lotH, slots: p.slots, buffer: p.buffer, vehicles, style, ring: setup.ring, arms: setup.arms,
+    total, tries: setup.tries };
+}
+
+// `dig` is how often the next passengers belong to the most recently freed vehicle: the deeper
+// it is, the more the player has to park other vehicles first to reach it.
+function makeStream(escape, openLimit, stick, rng, dig = 0) {
+  const open = [];
+  let next = 0;
+  const stream = [];
+  while (open.length < openLimit && next < escape.length) {
+    const v = escape[next++];
+    open.push({ v, rem: TYPES[v.type].seats });
+  }
+  // Passengers come in blocks of one color, a rank or more at a time.
+  let last = -1;
+  while (open.length) {
+    let color;
+    if (last >= 0 && open.some((o) => o.v.color === last) && rng() < stick) color = last;
+    else if (rng() < dig) color = open[open.length - 1].v.color;
+    else color = open[Math.floor(rng() * open.length)].v.color;
+    let block = PER_RANK * (3 + Math.floor(rng() * 4));
+    last = color;
+    while (block-- > 0) {
+      const target = open.find((o) => o.v.color === color);
+      if (!target) break;
+      target.rem--;
+      stream.push(color);
+      if (target.rem === 0) {
+        open.splice(open.indexOf(target), 1);
+        if (next < escape.length) {
+          const v = escape[next++];
+          open.push({ v, rem: TYPES[v.type].seats });
+        }
+      }
+    }
+  }
+  return stream;
+}
+
+// Lays the stream out so the gate meets it in order: the loop first, then the arms.
+function placeStream(stream, track, armCount, onLoop) {
+  const ring = makeRing(track.ranks);
+  const loopRanks = Math.min(track.ranks, Math.ceil(Math.min(onLoop, stream.length) / PER_RANK));
+  let i = 0;
+  for (let k = 0; k < loopRanks; k++) {
+    const pos = ((track.gateIdx - 1 - k) % track.ranks + track.ranks) % track.ranks;
+    for (let l = 0; l < PER_RANK && i < stream.length; l++) ring.cells[cellAt(ring, pos)][l] = stream[i++];
+  }
+  const arms = Array.from({ length: armCount }, () => []);
+  let a = 0;
+  while (i < stream.length) {
+    for (let l = 0; l < PER_RANK && i < stream.length; l++) arms[a].push(stream[i++]);
+    a = (a + 1) % armCount;
+  }
+  return { ring: { offset: ring.offset, cells: ring.cells.map((c) => c.slice()) }, arms };
+}
+
+// One tick of the loop: rotate, let the rank at the gate board, then refill from the arms.
+export function ringTick(ring, track, arms, tryBoard) {
+  ring.offset++;
+  const g = ring.cells[cellAt(ring, track.gateIdx)];
+  for (let l = 0; l < PER_RANK; l++) {
+    if (g[l] !== null && tryBoard(g[l], l)) g[l] = null;
+  }
+  track.merges.forEach((m, k) => {
+    const arm = arms[k];
+    if (!arm || !arm.length) return;
+    const cell = ring.cells[cellAt(ring, m)];
+    for (let l = 0; l < PER_RANK && arm.length; l++) {
+      if (cell[l] === null) cell[l] = arm.shift();
+    }
+  });
+}
+
+// Plays the level the intended way (tap in escape order, keep `openLimit` parked) with the
+// rotating loop, to make sure the passenger layout can't deadlock.
+function simulate(start, track, escape, openLimit) {
+  const ring = { ranks: track.ranks, offset: start.ring.offset, cells: start.ring.cells.map((c) => c.slice()) };
+  const arms = start.arms.map((a) => a.slice());
+  const total = escape.reduce((a, v) => a + TYPES[v.type].seats, 0);
+  const open = [];
+  let next = 0, boarded = 0, idle = 0;
+  const refill = () => {
+    while (open.length < openLimit && next < escape.length) {
+      const v = escape[next++];
+      open.push({ color: v.color, rem: TYPES[v.type].seats });
+    }
+  };
+  refill();
+  while (boarded < total) {
+    let got = false;
+    ringTick(ring, track, arms, (color) => {
+      const o = open.find((x) => x.color === color && x.rem > 0);
+      if (!o) return false;
+      o.rem--;
+      boarded++;
+      got = true;
+      if (o.rem === 0) { open.splice(open.indexOf(o), 1); refill(); }
+      return true;
+    });
+    idle = got ? 0 : idle + 1;
+    if (idle > track.ranks * 2 + 10) return false;
+  }
+  return true;
 }

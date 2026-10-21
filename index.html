@@ -21,17 +21,18 @@
   <!-- In-game HUD -->
   <div id="hud">
     <div class="topbar">
-      <button id="settingsBtn" class="round" aria-label="Settings">⚙️</button>
-      <div class="levelpill">
-        <div><span id="levelLabel">Level 1</span> <span id="levelBadge" class="badge"></span></div>
-        <div class="progress"><div id="progressFill"></div></div>
+      <button id="restartTop" class="sq" aria-label="Restart level">↻</button>
+      <div class="title">
+        <div id="levelLabel">Level 1</div>
+        <span id="levelBadge" class="badge"></span>
       </div>
-      <div class="coins"><span class="coin">🪙</span><span id="coinCount">0</span></div>
+      <button id="pauseBtn" class="sq" aria-label="Pause">❚❚</button>
     </div>
+    <div id="mood" aria-hidden="true">😄</div>
     <div id="boosters" class="boosters">
-      <button data-booster="spot"><span class="ico">🅿️</span><span class="name">+Spot</span><span class="count">🪙50</span></button>
-      <button data-booster="shuffle"><span class="ico">🔀</span><span class="name">Shuffle</span><span class="count">0</span></button>
       <button data-booster="vip"><span class="ico">🚁</span><span class="name">VIP</span><span class="count">0</span></button>
+      <button data-booster="arrange"><span class="ico">🚌</span><span class="name">Arrange</span><span class="count">0</span></button>
+      <button data-booster="jumble"><span class="ico">🎨</span><span class="name">Jumble</span><span class="count">0</span></button>
     </div>
   </div>
 
@@ -43,7 +44,7 @@
 
   <!-- Home -->
   <div id="home" class="screen">
-    <div class="homecoins"><span class="coin">🪙</span><span id="homeCoins">0</span></div>
+    <div class="homecoins"><span class="coin">🪙</span><span class="coinCount">0</span></div>
     <div class="logo">
       <div class="logo-top">BUS</div>
       <div class="logo-bot">PARTY!</div>
@@ -94,12 +95,12 @@
   <!-- Settings -->
   <div id="settings" class="screen modal-screen">
     <div class="panel">
-      <h2>Settings</h2>
+      <h2>Paused</h2>
+      <div class="coinline"><span class="coin">🪙</span> <b class="coinCount">0</b> coins</div>
       <button id="soundToggle" class="mid blue">Sound: On</button>
       <button id="musicToggle" class="mid blue">Music: On</button>
       <button id="vibeToggle" class="mid blue">Vibration: On</button>
-      <button id="restartBtn" class="mid yellow">↻ Restart Level</button>
-      <button id="homeBtn" class="mid purple">🏠 Home</button>
+            <button id="homeBtn" class="mid purple">🏠 Home</button>
       <button id="transferBtn" class="mid yellow">📲 Move progress</button>
       <button id="resetBtn" class="small ghost">Reset progress</button>
       <button id="settingsClose" class="mid green">Done</button>

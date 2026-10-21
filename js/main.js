@@ -1,34 +1,41 @@
 import * as THREE from './vendor/three.module.min.js';
-import { generateLevel, levelKind, COLORS, TYPES, MAX_LEVEL } from './levels.js';
-import { makeOBB, sweepDistance, roundedPath, makePath, samplePath, lerpAngle, dirVec } from './geom.js';
-import { buildVehicle, setVehicleColor, buildPassenger, makeLabel, buildWorld, computeLayout, MYSTERY_HEX } from './models.js';
+import { generateLevel, levelKind, COLORS, TYPES, MAX_LEVEL, ROW_HALF_W } from './levels.js';
+import { makeOBB, sweepDistance, roundedPath, samplePath, lerpAngle, dirVec } from './geom.js';
+import { buildVehicle, setVehicleColor, buildCrowd, makeLabel, buildWorld, computeLayout, MYSTERY_HEX, themeFor } from './models.js';
+import { buildTrack, laneOffset, PER_RANK, makeRing, cellAt } from './track.js';
 import { sfx, unlockAudio, setSoundEnabled, setMusicEnabled } from './audio.js';
 
 // ---------------- Save data ----------------
 // Economy: coins come only from winning levels (no ads, no purchases). Each level starts with
-// 4 regular spots; the 4 extra spots cost coins and reset when the level ends.
+// 4 regular spots; the 3 extra spots cost coins and reset when the level ends.
 const ECON = {
   startCoins: 100,
   reward: { normal: 20, hard: 40, super: 60 },
   replayReward: 5,
-  price: { spot: 50, shuffle: 80, vip: 120 },
-  unlockLevel: { shuffle: 6, vip: 11 },
+  price: { spot: 50, vip: 120, arrange: 90, jumble: 80 },
+  unlockLevel: { jumble: 6, arrange: 8, vip: 11 },
   freeOnUnlock: 2,
 };
 const SAVE_KEY = 'busparty-save-v2';
+const RUN_KEY = 'busparty-run-v2';
 const save = loadSave();
 function loadSave() {
   const def = {
-    level: 1, coins: ECON.startCoins, boosters: { shuffle: 0, vip: 0 }, unlocked: { shuffle: false, vip: false },
+    level: 1, coins: ECON.startCoins, boosters: { vip: 0, arrange: 0, jumble: 0 }, unlocked: { vip: false, arrange: false, jumble: false },
     cleared: {}, sound: true, music: true, vibrate: true, seenTips: {},
   };
   try {
     const s = JSON.parse(localStorage.getItem(SAVE_KEY));
     if (s && typeof s === 'object') {
-      return { ...def, ...s, boosters: { ...def.boosters, ...s.boosters }, unlocked: { ...def.unlocked, ...s.unlocked },
+      const out = { ...def, ...s, boosters: { ...def.boosters, ...s.boosters }, unlocked: { ...def.unlocked, ...s.unlocked },
         cleared: { ...s.cleared }, seenTips: { ...s.seenTips } };
+      // Older saves called Jumble "shuffle".
+      if (out.boosters.shuffle) { out.boosters.jumble += out.boosters.shuffle; }
+      if (out.unlocked.shuffle) out.unlocked.jumble = true;
+      delete out.boosters.shuffle;
+      delete out.unlocked.shuffle;
+      return out;
     }
-    // Carry level and coins over from the first version of the game.
     const old = JSON.parse(localStorage.getItem('busparty-save-v1'));
     if (old && typeof old === 'object') {
       def.level = Math.max(1, Math.min(MAX_LEVEL, old.level | 0 || 1));
@@ -38,40 +45,28 @@ function loadSave() {
   } catch (e) { /* ignore */ }
   return def;
 }
-// Set just before a deliberate reload (loading a code, resetting) so the save-on-close
-// handlers don't write the old in-memory progress back over the new data.
+// Set just before a deliberate reload so save-on-close doesn't write old data back.
 let reloading = false;
 function persist() {
   if (reloading) return;
   try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) { /* ignore */ }
 }
-// Ask the browser not to clear our saved data when the phone is low on space.
 function askPersistentStorage() {
   try { navigator.storage?.persist?.(); } catch (e) { /* ignore */ }
 }
-
-// Progress code: iPhone keeps Safari and Home Screen app data apart, so this moves it across.
-function progressCode() {
-  const data = { v: 2, save, run: readRun() };
-  return 'BP-' + btoa(unescape(encodeURIComponent(JSON.stringify(data))));
-}
-function loadProgressCode(code) {
-  const raw = code.trim().replace(/^BP-/, '').replace(/\s+/g, '');
-  const data = JSON.parse(decodeURIComponent(escape(atob(raw))));
-  if (!data || !data.save || typeof data.save.level !== 'number' || typeof data.save.coins !== 'number') throw new Error('bad code');
-  localStorage.setItem(SAVE_KEY, JSON.stringify(data.save));
-  if (data.run) localStorage.setItem(RUN_KEY, JSON.stringify(data.run)); else localStorage.removeItem(RUN_KEY);
+function showCoins() {
+  for (const el of document.querySelectorAll('.coinCount')) el.textContent = save.coins;
 }
 function addCoins(n) {
   save.coins = Math.max(0, save.coins + n);
   persist();
-  ui.coinCount.textContent = save.coins;
-  ui.homeCoins.textContent = save.coins;
+  showCoins();
 }
 setSoundEnabled(save.sound);
 setMusicEnabled(save.music);
 
-const EXTRA_SLOTS = 4;
+const EXTRA_SLOTS = 3;
+const TICK = 0.12; // seconds per step of the rotating loop
 const canVibrate = typeof navigator.vibrate === 'function';
 function buzz(ms) {
   if (save.vibrate && canVibrate) try { navigator.vibrate(ms); } catch (e) { /* ignore */ }
@@ -83,36 +78,34 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPrefere
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
+renderer.toneMappingExposure = 1.08;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x9fdcff);
-scene.fog = new THREE.Fog(0x9fdcff, 40, 75);
-
-const camera = new THREE.PerspectiveCamera(34, 1, 0.5, 200);
-const hemi = new THREE.HemisphereLight(0xdff3ff, 0x6c8f4a, 1.15);
-scene.add(hemi);
-const sun = new THREE.DirectionalLight(0xfff1dc, 2.1);
+scene.background = new THREE.Color(0xf7dcd8);
+const camera = new THREE.PerspectiveCamera(30, 1, 0.5, 200);
+scene.add(new THREE.HemisphereLight(0xffffff, 0xb8b0c8, 1.5));
+const sun = new THREE.DirectionalLight(0xfff6ea, 1.9);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.bias = -0.0004;
+sun.shadow.bias = -0.0005;
 sun.shadow.normalBias = 0.02;
-sun.shadow.radius = 4;
+sun.shadow.radius = 3;
 scene.add(sun);
 scene.add(sun.target);
 
 // ---------------- Game state ----------------
-let G = null; // current level runtime
+let G = null;
 const raycaster = new THREE.Raycaster();
+const $ = (id) => document.getElementById(id);
 const ui = {};
-for (const id of ['hud', 'levelLabel', 'levelBadge', 'coinCount', 'progressFill', 'boosters', 'toast', 'vipBanner',
+for (const id of ['hud', 'levelLabel', 'levelBadge', 'boosters', 'toast', 'vipBanner', 'mood', 'restartTop', 'pauseBtn',
   'home', 'homeLevel', 'playBtn', 'levelsBtn', 'levels', 'levelGrid', 'levelsClose', 'win', 'winCoins', 'winNote',
-  'winNext', 'winTitle', 'lose', 'loseSpot', 'loseRetry', 'loseSpotPrice', 'loseVip', 'loseVipPrice', 'settings', 'settingsBtn',
-  'soundToggle', 'musicToggle', 'vibeToggle', 'settingsClose', 'restartBtn', 'homeBtn', 'resetBtn', 'tutorial', 'tutText', 'hand',
-  'homeCoins', 'confetti', 'tip', 'tipTitle', 'tipText', 'tipOk', 'buy', 'buyTitle', 'buyText', 'buyOk', 'buyCancel', 'homeSettings']) {
-  ui[id] = document.getElementById(id);
+  'winNext', 'winTitle', 'lose', 'loseSpot', 'loseRetry', 'loseSpotPrice', 'loseVip', 'loseVipPrice', 'settings',
+  'soundToggle', 'musicToggle', 'vibeToggle', 'settingsClose', 'homeBtn', 'resetBtn', 'tutorial', 'tutText', 'hand',
+  'confetti', 'tip', 'tipTitle', 'tipText', 'tipOk', 'buy', 'buyTitle', 'buyText', 'buyOk', 'buyCancel', 'homeSettings']) {
+  ui[id] = $(id);
 }
 
 function fitCamera() {
@@ -121,21 +114,20 @@ function fitCamera() {
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   const L = G.layout;
+  const xs = Math.max(L.hw + 0.35, ROW_HALF_W + 0.15);
+  const top = L.gate.z - G.track.rz * 2 - 0.55;
   const pts = [];
-  const xs = Math.max(L.ring.x1 + 0.8, L.queueHalfW + 0.4, (L.slotsX.length * L.bayW) / 2 + 0.2);
   for (const x of [-xs, xs]) {
-    pts.push(new THREE.Vector3(x, 0, L.ring.z1 + 0.75));
-    pts.push(new THREE.Vector3(x, 1.0, L.ring.z1 + 0.75));
-    pts.push(new THREE.Vector3(x, 0, L.queueHeadZ - 2.25));
-    pts.push(new THREE.Vector3(x, 0.8, L.queueHeadZ - 2.25));
+    pts.push(new THREE.Vector3(x, 0, L.hh + 0.35), new THREE.Vector3(x, 0, top), new THREE.Vector3(x, 0.6, L.hh + 0.35));
   }
-  const safeTop = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sat')) || 0;
-  const safeBot = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sab')) || 0;
-  const topPx = 96 + safeTop, botPx = 118 + safeBot;
+  const css = getComputedStyle(document.documentElement);
+  const safeTop = parseFloat(css.getPropertyValue('--sat')) || 0;
+  const safeBot = parseFloat(css.getPropertyValue('--sab')) || 0;
+  const topPx = 18 + safeTop, botPx = 128 + safeBot;
   const yTop = 1 - (2 * topPx) / h, yBot = -1 + (2 * botPx) / h;
-  const elev = THREE.MathUtils.degToRad(w / h > 0.8 ? 50 : 55);
+  const elev = THREE.MathUtils.degToRad(w / h > 0.8 ? 58 : 66);
   const dir = new THREE.Vector3(0, Math.sin(elev), Math.cos(elev));
-  const target = new THREE.Vector3(0, 0, (L.ring.z1 + L.queueHeadZ - 2.2) / 2);
+  const target = new THREE.Vector3(0, 0, (L.hh + top) / 2);
   const fits = (dist) => {
     camera.position.copy(target).addScaledVector(dir, dist);
     camera.lookAt(target);
@@ -144,7 +136,7 @@ function fitCamera() {
     let minY = Infinity, maxY = -Infinity, ok = true;
     for (const p of pts) {
       const q = p.clone().project(camera);
-      if (Math.abs(q.x) > 0.97) ok = false;
+      if (Math.abs(q.x) > 0.985) ok = false;
       minY = Math.min(minY, q.y);
       maxY = Math.max(maxY, q.y);
     }
@@ -152,7 +144,7 @@ function fitCamera() {
     return { ok, minY, maxY };
   };
   const fitDist = () => {
-    let lo = 5, hi = 120;
+    let lo = 5, hi = 140;
     for (let i = 0; i < 30; i++) {
       const mid = (lo + hi) / 2;
       if (fits(mid).ok) hi = mid; else lo = mid;
@@ -163,17 +155,15 @@ function fitCamera() {
     const dist = fitDist();
     const r = fits(dist);
     const want = (yTop + yBot) / 2, have = (r.minY + r.maxY) / 2;
-    // Pan along the ground so the content sits between the HUD bars.
     const halfH = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * dist;
     target.z -= ((have - want) * halfH) / Math.sin(elev);
   }
   fits(fitDist());
-  // Shadow camera covers the play area.
-  const ext = Math.max(xs, (L.ring.z1 - L.queueHeadZ) / 2 + 3) + 2;
-  sun.position.set(target.x - 8, 18, target.z + 6);
+  const ext = Math.max(xs, (L.hh - top) / 2) + 3;
+  sun.position.set(target.x - 6, 20, target.z + 8);
   sun.target.position.copy(target);
   const sc = sun.shadow.camera;
-  sc.left = -ext; sc.right = ext; sc.top = ext; sc.bottom = -ext; sc.near = 1; sc.far = 50;
+  sc.left = -ext; sc.right = ext; sc.top = ext; sc.bottom = -ext; sc.near = 1; sc.far = 60;
   sc.updateProjectionMatrix();
 }
 window.addEventListener('resize', () => setTimeout(fitCamera, 50));
@@ -183,7 +173,7 @@ function clearLevel() {
   if (!G) return;
   scene.remove(G.root);
   G.root.traverse((o) => {
-    if (o.material && o.material.map && o.isSprite) o.material.map.dispose();
+    if (o.isSprite && o.material.map) o.material.map.dispose();
   });
   G = null;
 }
@@ -193,80 +183,107 @@ function loadLevel(n, run = null) {
   const level = generateLevel(n);
   const maxSlots = level.slots + EXTRA_SLOTS;
   const layout = computeLayout(level, maxSlots);
+  const track = buildTrack(level.style, layout.gate, ROW_HALF_W, layout.gate.z - 4.5);
+  scene.background = new THREE.Color(themeFor(n).sky);
   const root = new THREE.Group();
   scene.add(root);
-  root.add(buildWorld(level, layout, maxSlots, n * 977 + 13));
+  if (run && (run.n !== n || run.vs.length !== level.vehicles.length || run.ring.cells.length !== track.ranks)) run = null;
 
   G = {
-    n, level, layout, root, maxSlots,
-    unlocked: level.slots,
+    n, level, layout, track, root, maxSlots,
+    unlocked: run ? Math.min(maxSlots, Math.max(level.slots, run.unlocked | 0)) : level.slots,
     slots: new Array(maxSlots + 1).fill(null), // last entry is the VIP spot
     vehicles: [],
-    queue: [],
+    people: [],
+    ring: makeRing(track.ranks),
+    arms: [],
     walkers: [],
     boarded: 0,
-    total: level.queue.length,
+    total: level.total,
     tapCounter: 0,
     state: 'playing',
     stuckT: 0,
     winT: 0,
+    tickT: 0,
     vip: false,
     time: 0,
-    lockTiles: [],
-    hintRing: null,
   };
+
+  const world = buildWorld(level, layout, track, maxSlots, G.unlocked, n * 977 + 13);
+  root.add(world.group);
+  G.bays = world.bays;
+  // Invisible tap targets for the locked spots.
+  G.bayHits = world.bays.filter((b) => !b.isVip).map((b) => {
+    const hit = new THREE.Mesh(new THREE.BoxGeometry(layout.bayW - 0.1, 0.4, layout.bayLen), new THREE.MeshBasicMaterial({ visible: false }));
+    hit.position.set(b.x, 0.2, (layout.rowTop + layout.rowBottom) / 2);
+    hit.userData.slot = b.slotIndex;
+    root.add(hit);
+    return hit;
+  });
 
   for (const d of level.vehicles) {
     const t = TYPES[d.type];
     const a = (d.dir * Math.PI) / 4;
-    const hex = d.mystery ? MYSTERY_HEX : COLORS[d.color].hex;
-    const m = buildVehicle(d.type, hex);
-    m.root.position.set(d.x, 0.11, d.z);
+    const m = buildVehicle(d.type, d.mystery ? MYSTERY_HEX : COLORS[d.color].hex);
+    m.root.position.set(d.x, 0.04, d.z);
     m.root.rotation.y = -a;
     root.add(m.root);
     const v = {
       id: d.id, type: d.type, seats: t.seats, color: d.color, mystery: d.mystery,
       x: d.x, z: d.z, a, obb: makeOBB(d.x, d.z, a, t.len / 2, t.wid / 2),
       state: 'lot', slot: -1, tapOrder: 0, filled: 0, incoming: 0,
-      m, shake: 0, label: null, q: null, y: 0.11, rollV: 0,
+      m, shake: 0, label: null, q: null, rollV: 0,
     };
     m.hit.userData.vehicle = v;
     if (d.mystery) {
-      v.q = makeLabel('?', { w: 1.2, bg: 'rgba(255,255,255,0.97)', fg: '#4a5163', size: 96, border: '#8b93a5' });
-      v.q.position.set(0, m.roofY + 0.5, 0);
+      v.q = makeLabel('?', { w: 0.9, bg: 'rgba(255,255,255,0.97)', fg: '#4a5163', size: 96, border: '#8b93a5' });
+      v.q.position.set(0, m.roofY + 0.35, 0);
       m.root.add(v.q);
     }
     G.vehicles.push(v);
   }
 
-  for (let i = 0; i < level.queue.length; i++) G.queue.push({ color: level.queue[i], mesh: null, walk: 0 });
-  G.moreLabel = makeLabel('', { w: 1.5, bg: 'rgba(255,255,255,0.95)', fg: '#2a3142', size: 64 });
-  G.moreLabel.visible = false;
-  root.add(G.moreLabel);
-
+  // Crowd: one instance per passenger still waiting.
+  G.crowd = buildCrowd(level.total + 4);
+  root.add(G.crowd.group);
+  const ringColors = run ? run.ring : level.ring;
+  const armColors = run ? run.arms : level.arms;
+  G.ring.offset = ringColors.offset | 0;
+  let idx = 0;
+  const person = (color, mode) => {
+    const p = { color, i: idx++, x: 0, z: 0, ry: 0, walk: Math.random() * 6, mode, s: 1 };
+    G.crowd.setColor(p.i, COLORS[color].hex);
+    G.people.push(p);
+    return p;
+  };
+  ringColors.cells.forEach((cell, c) => cell.forEach((col, l) => {
+    if (col !== null && col !== undefined) G.ring.cells[c][l] = person(col, 'ring');
+  }));
+  G.arms = armColors.map((arm) => arm.map((col) => person(col, 'arm')));
+  for (let i = idx; i < G.crowd.max; i++) G.crowd.set(i, 0, -10, 0, 0, 0);
+  G.boardedBase = G.total - G.people.length; // passengers already seated when resuming
   if (run) restoreRun(run);
-  buildLockTiles();
+  placePeople(true);
+
   revealFreeMysteries(true);
-  syncQueueMeshes(true);
   fitCamera();
   updateHud();
   showTutorial();
 }
 
-// ---------------- Level in progress (resume after closing the app) ----------------
-const RUN_KEY = 'busparty-run-v1';
+// ---------------- Level in progress (resume after closing) ----------------
 function readRun() {
   try {
     const r = JSON.parse(localStorage.getItem(RUN_KEY));
-    return r && typeof r === 'object' && Array.isArray(r.vs) ? r : null;
+    return r && typeof r === 'object' && Array.isArray(r.vs) && r.ring && Array.isArray(r.ring.cells) ? r : null;
   } catch (e) { return null; }
 }
 function clearRun() {
   try { localStorage.removeItem(RUN_KEY); } catch (e) { /* ignore */ }
 }
-// Saves the current level as if every moving vehicle and walking passenger had arrived.
+// Saves the level as if every moving vehicle and walking passenger had already arrived.
 function saveRun() {
-  if (reloading || !G || (G.state !== 'playing' && G.state !== 'lost')) return;
+  if (reloading || !G || (G.state !== 'playing' && G.state !== 'lost' && G.state !== 'paused')) return;
   const vs = G.vehicles.map((v) => {
     let st = v.state;
     if (st === 'bump') st = 'lot';
@@ -277,17 +294,15 @@ function saveRun() {
     return { s: st, slot: v.slot, f, c: v.color, m: v.mystery, t: v.tapOrder };
   });
   const run = {
-    n: G.n, unlocked: G.unlocked, tap: G.tapCounter, boarded: G.boarded + G.walkers.length,
-    queue: G.queue.map((p) => p.color), vs,
+    n: G.n, unlocked: G.unlocked, tap: G.tapCounter,
+    ring: { offset: G.ring.offset, cells: G.ring.cells.map((cell) => cell.map((p) => (p ? p.color : null))) },
+    arms: G.arms.map((arm) => arm.map((p) => p.color)),
+    vs,
   };
   try { localStorage.setItem(RUN_KEY, JSON.stringify(run)); } catch (e) { /* ignore */ }
 }
 function restoreRun(run) {
-  if (run.n !== G.n || run.vs.length !== G.vehicles.length) return;
-  G.unlocked = Math.min(G.maxSlots, Math.max(G.unlocked, run.unlocked | 0));
   G.tapCounter = run.tap | 0;
-  G.boarded = run.boarded | 0;
-  G.queue = run.queue.map((c) => ({ color: c, mesh: null, walk: 0 }));
   run.vs.forEach((r, i) => {
     const v = G.vehicles[i];
     v.color = r.c;
@@ -302,118 +317,149 @@ function restoreRun(run) {
       v.tapOrder = r.t;
       G.slots[r.slot] = v;
       if (v.mystery) reveal(v, true);
-      arrive(v);
+      arrive(v, true);
     }
   });
 }
-// Save a few times a second while playing, and right away when the app is closed.
 let runSaveT = 0;
-function tickRunSave(dt) {
-  runSaveT += dt;
-  if (runSaveT > 0.5) { runSaveT = 0; saveRun(); }
-}
 document.addEventListener('visibilitychange', () => { if (document.hidden) { saveRun(); persist(); } });
 window.addEventListener('pagehide', () => { saveRun(); persist(); });
 
-function buildLockTiles() {
-  for (const t of G.lockTiles) G.root.remove(t);
-  G.lockTiles = [];
-  const L = G.layout;
-  for (let i = G.unlocked; i < G.maxSlots; i++) {
-    const tile = new THREE.Group();
-    const plate = new THREE.Mesh(new THREE.BoxGeometry(L.bayW - 0.22, 0.05, L.bayLen - 0.3),
-      new THREE.MeshStandardMaterial({ color: 0x3a3f4b, roughness: 0.8, transparent: true, opacity: 0.85 }));
-    plate.position.y = 0.04;
-    tile.add(plate);
-    const lbl = makeLabel(`+ 🪙${ECON.price.spot}`, { w: 1.25, bg: 'rgba(255,200,40,0.97)', fg: '#5a3a00', size: 58, border: '#fff' });
-    lbl.position.y = 0.7;
-    tile.add(lbl);
-    tile.position.set(L.slotsX[i], 0, (L.bayTop + L.bayBottom) / 2);
-    plate.userData.lockedSlot = i;
-    tile.userData.plate = plate;
-    G.root.add(tile);
-    G.lockTiles.push(tile);
+// Progress code: iPhone keeps Safari and Home Screen app data apart, so this moves it across.
+function progressCode() {
+  return 'BP-' + btoa(unescape(encodeURIComponent(JSON.stringify({ v: 3, save, run: readRun() }))));
+}
+function loadProgressCode(code) {
+  const raw = code.trim().replace(/^BP-/, '').replace(/\s+/g, '');
+  const data = JSON.parse(decodeURIComponent(escape(atob(raw))));
+  if (!data || !data.save || typeof data.save.level !== 'number' || typeof data.save.coins !== 'number') throw new Error('bad code');
+  localStorage.setItem(SAVE_KEY, JSON.stringify(data.save));
+  if (data.run) localStorage.setItem(RUN_KEY, JSON.stringify(data.run)); else localStorage.removeItem(RUN_KEY);
+}
+
+// ---------------- Crowd ----------------
+function ringTarget(c, l) {
+  const T = G.track;
+  const pos = (c + G.ring.offset) % T.ranks;
+  const f = Math.min(1, G.tickT / TICK);
+  const a = T.loop[pos], b = T.loop[(pos + 1) % T.ranks];
+  const ta = T.loopTan[pos], tb = T.loopTan[(pos + 1) % T.ranks];
+  const tan = { x: ta.x + (tb.x - ta.x) * f, z: ta.z + (tb.z - ta.z) * f };
+  const off = laneOffset(tan, l);
+  return { x: a.x + (b.x - a.x) * f + off.x, z: a.z + (b.z - a.z) * f + off.z, tx: tan.x, tz: tan.z };
+}
+function armTarget(k, i) {
+  const arm = G.track.arms[k];
+  const j = Math.min(Math.floor(i / PER_RANK) + 1, arm.pts.length - 1);
+  const p = arm.pts[j], t = arm.tan[j];
+  const off = laneOffset(t, i % PER_RANK);
+  return { x: p.x + off.x, z: p.z + off.z, tx: t.x, tz: t.z };
+}
+
+function placePeople(instant, dt = 0) {
+  const k = instant ? 1 : 1 - Math.exp(-dt * 14);
+  const cr = G.crowd;
+  const move = (p, t) => {
+    p.x += (t.x - p.x) * k;
+    p.z += (t.z - p.z) * k;
+    p.ry = Math.atan2(-t.tx, -t.tz);
+    p.walk += dt * 14;
+    const bob = Math.abs(Math.sin(p.walk)) * 0.025;
+    cr.set(p.i, p.x, bob, p.z, p.ry, p.s, 1 - bob);
+  };
+  G.ring.cells.forEach((cell, c) => cell.forEach((p, l) => { if (p) move(p, ringTarget(c, l)); }));
+  G.arms.forEach((arm, a) => arm.forEach((p, i) => move(p, armTarget(a, i))));
+  for (const w of G.walkers) {
+    const p = w.p;
+    p.walk += dt * 20;
+    cr.set(p.i, p.x, Math.abs(Math.sin(p.walk)) * 0.05, p.z, p.ry, p.s);
   }
+  cr.commit();
 }
 
-// ---------------- Queue ----------------
-const SP = 0.43;
-const ROW_DZ = 0.62;
-const VISIBLE_ROWS = 4;
-function queuePos(i) {
-  const L = G.layout;
-  const half = L.queueHalfW - 0.3;
-  const k0 = Math.floor(half / SP) + 1;
-  if (i < k0) return { x: -i * SP, z: L.queueHeadZ, row: 0 };
-  i -= k0;
-  const kr = Math.floor((2 * half) / SP) + 1;
-  const row = 1 + Math.floor(i / kr);
-  const j = i % kr;
-  const x = row % 2 === 1 ? -half + j * SP : half - j * SP;
-  return { x, z: L.queueHeadZ - row * ROW_DZ, row };
-}
-
-function syncQueueMeshes(instant) {
-  let visibleCount = 0;
-  for (let i = 0; i < G.queue.length; i++) {
-    const p = queuePos(i);
-    const pas = G.queue[i];
-    if (p.row >= VISIBLE_ROWS) break;
-    visibleCount++;
-    if (!pas.mesh) {
-      pas.mesh = buildPassenger(COLORS[pas.color].hex);
-      const spawn = instant ? p : queuePos(i + 1);
-      pas.mesh.position.set(spawn.x, 0.12, spawn.z);
-      if (!instant) pas.mesh.scale.setScalar(0.01);
-      G.root.add(pas.mesh);
+// One step of the loop: rotate, the rank at the gate boards, arms refill empty places.
+function ringStep() {
+  const ring = G.ring, T = G.track;
+  ring.offset++;
+  if (G.state === 'playing') {
+    const gate = ring.cells[cellAt(ring, T.gateIdx)];
+    for (let l = 0; l < PER_RANK; l++) {
+      const p = gate[l];
+      if (!p) continue;
+      const v = boardTarget(p.color);
+      if (v) { gate[l] = null; startWalk(p, v); }
     }
   }
-  const more = G.queue.length - visibleCount;
-  if (more > 0) {
-    const p = queuePos(visibleCount - 1);
-    G.moreLabel.userData.draw(`+${more}`);
-    G.moreLabel.position.set(p.x + (p.row % 2 === 1 ? 0.95 : -0.95), 0.9, p.z);
-    G.moreLabel.visible = true;
-  } else G.moreLabel.visible = false;
+  T.merges.forEach((m, k) => {
+    const arm = G.arms[k];
+    if (!arm || !arm.length) return;
+    const cell = ring.cells[cellAt(ring, m)];
+    for (let l = 0; l < PER_RANK && arm.length; l++) {
+      if (!cell[l]) { const p = arm.shift(); p.mode = 'ring'; cell[l] = p; }
+    }
+  });
 }
 
-function updateQueue(dt) {
-  for (let i = 0; i < G.queue.length; i++) {
-    const pas = G.queue[i];
-    if (!pas.mesh) break;
-    const p = queuePos(i);
-    const m = pas.mesh;
-    const dx = p.x - m.position.x, dz = p.z - m.position.z;
+function boardTarget(color) {
+  let target = null;
+  for (const v of G.vehicles) {
+    if (v.state !== 'parked' || v.color !== color || v.filled + v.incoming >= v.seats) continue;
+    if (!target || v.tapOrder < target.tapOrder) target = v;
+  }
+  return target;
+}
+
+function startWalk(p, v) {
+  v.incoming++;
+  p.mode = 'walk';
+  G.walkers.push({ p, v });
+}
+
+function updateWalkers(dt) {
+  const L = G.layout;
+  for (let i = G.walkers.length - 1; i >= 0; i--) {
+    const w = G.walkers[i];
+    const p = w.p;
+    const tx = L.slotsX[w.v.slot];
+    const tz = parkZ(w.v) - TYPES[w.v.type].len / 2 + 0.05;
+    // Head down through the gate first, then across to the vehicle.
+    const gx = L.gate.x, gz = L.gate.z + 0.45;
+    const viaGate = p.z < gz - 0.1;
+    const ax = viaGate ? gx + (tx - gx) * 0.15 : tx, az = viaGate ? gz : tz;
+    const dx = ax - p.x, dz = az - p.z;
     const d = Math.hypot(dx, dz);
     const step = 7 * dt;
-    if (d > 0.001) {
-      if (d <= step) m.position.set(p.x, 0.12, p.z);
-      else { m.position.x += (dx / d) * step; m.position.z += (dz / d) * step; }
-      pas.walk += dt * 18;
-      m.rotation.y = Math.atan2(dx, dz);
+    if (d > 1e-4) p.ry = Math.atan2(-dx, -dz);
+    if (!viaGate && d <= step) {
+      p.s = 0;
+      p.mode = 'done';
+      G.crowd.set(p.i, 0, -10, 0, 0, 0);
+      G.walkers.splice(i, 1);
+      w.v.incoming--;
+      w.v.filled++;
+      G.boarded++;
+      if (w.v.label) w.v.label.userData.draw(`${w.v.filled}/${w.v.seats}`);
+      w.v.bounce = Math.max(w.v.bounce || 0, 0.5);
+      sfx.board(w.v.filled);
     } else {
-      pas.walk = 0;
-      m.rotation.y = lerpAngle(m.rotation.y, 0, Math.min(1, dt * 8));
+      p.x += (dx / Math.max(d, 1e-6)) * Math.min(step, d);
+      p.z += (dz / Math.max(d, 1e-6)) * Math.min(step, d);
+      if (!viaGate && d < 0.5) p.s = Math.max(0.35, d / 0.5);
     }
-    animatePerson(m, pas.walk, dt);
   }
 }
 
-function animatePerson(m, walk, dt) {
-  const s = m.scale.x;
-  if (s < 1) m.scale.setScalar(Math.min(1, s + dt * 5));
-  const inner = m.userData.inner;
-  inner.position.y = walk ? Math.abs(Math.sin(walk)) * 0.05 : 0;
-  const [l1, l2] = m.userData.legs;
-  l1.rotation.x = walk ? Math.sin(walk) * 0.6 : 0;
-  l2.rotation.x = -l1.rotation.x;
+function updateCrowd(dt) {
+  G.tickT += dt;
+  while (G.tickT >= TICK) {
+    G.tickT -= TICK;
+    ringStep();
+  }
+  updateWalkers(dt);
+  placePeople(false, dt);
 }
 
 // ---------------- Vehicles ----------------
-function lotVehicles() {
-  return G.vehicles.filter((v) => v.state === 'lot' || v.state === 'bump');
-}
-
 function blockInfo(v) {
   let best = Infinity, hit = null;
   for (const o of G.vehicles) {
@@ -451,7 +497,7 @@ function freeSlot() {
 }
 
 function parkZ(v) {
-  return G.layout.bayTop + 0.3 + TYPES[v.type].len / 2;
+  return G.layout.rowTop + 0.2 + TYPES[v.type].len / 2;
 }
 
 function buildDrivePath(v, slot) {
@@ -475,11 +521,9 @@ function buildDrivePath(v, slot) {
   const Tc = { x: Math.min(R.x1, Math.max(R.x0, sx)), z: R.z0 };
   const sH = param(H), sT = param(Tc);
   const cw = (((sT - sH) % P) + P) % P;
-  const goCW = cw <= P - cw;
   const pts = [{ x: v.x, z: v.z }, H];
-  if (goCW) {
-    // Walk corners clockwise from H until reaching T.
-    let s = sH;
+  let s = sH;
+  if (cw <= P - cw) {
     for (let guard = 0; guard < 5; guard++) {
       const nextCorner = cornerS.map((c, i) => ({ c: c <= s + 1e-6 ? c + P : c, i })).sort((a, b) => a.c - b.c)[0];
       const target = sT < s - 1e-6 ? sT + P : sT;
@@ -488,7 +532,6 @@ function buildDrivePath(v, slot) {
       s = nextCorner.c % P;
     }
   } else {
-    let s = sH;
     for (let guard = 0; guard < 5; guard++) {
       const prevCorner = cornerS.map((c, i) => ({ c: c >= s - 1e-6 ? c - P : c, i })).sort((a, b) => b.c - a.c)[0];
       const target = sT > s + 1e-6 ? sT - P : sT;
@@ -500,7 +543,7 @@ function buildDrivePath(v, slot) {
   pts.push(Tc);
   if (Math.abs(Tc.x - sx) > 1e-4) pts.push({ x: sx, z: R.z0 });
   pts.push({ x: sx, z: parkZ(v) });
-  return roundedPath(dedupe(pts), 0.85);
+  return roundedPath(dedupe(pts), 0.7);
 }
 
 function dedupe(pts) {
@@ -509,7 +552,6 @@ function dedupe(pts) {
     const p = out[out.length - 1];
     if (Math.hypot(pts[i].x - p.x, pts[i].z - p.z) > 0.02) out.push(pts[i]);
   }
-  // Drop collinear middle points.
   const res = [out[0]];
   for (let i = 1; i < out.length - 1; i++) {
     const a = res[res.length - 1], b = out[i], c = out[i + 1];
@@ -524,14 +566,12 @@ function dedupe(pts) {
 function buildLeavePath(v) {
   const L = G.layout;
   const sx = L.slotsX[v.slot];
-  return roundedPath([{ x: sx, z: parkZ(v) }, { x: sx, z: L.exitZ }, { x: 40, z: L.exitZ }], 0.75);
+  return roundedPath([{ x: sx, z: parkZ(v) }, { x: sx, z: L.laneZ }, { x: 40, z: L.laneZ }], 0.7);
 }
 
 function tapVehicle(v) {
-  if (G.state !== 'playing') return;
-  if (v.state !== 'lot') return;
+  if (G.state !== 'playing' || v.state !== 'lot') return;
   hideTutorialHand();
-  const slot = freeSlot();
   if (G.vip) {
     const vs = G.layout.vipSlot;
     if (G.slots[vs]) { toast('The VIP spot is busy'); sfx.error(); return; }
@@ -548,6 +588,7 @@ function tapVehicle(v) {
     sfx.tap();
     return;
   }
+  const slot = freeSlot();
   if (slot < 0) {
     toast('No spots available!');
     v.shake = 1;
@@ -564,6 +605,7 @@ function tapVehicle(v) {
   v.speed = 2;
   if (v.mystery) reveal(v, false);
   revealFreeMysteries(false);
+  updateMood();
 }
 
 function flyToSlot(v, slot) {
@@ -577,16 +619,17 @@ function flyToSlot(v, slot) {
   revealFreeMysteries(false);
 }
 
-function arrive(v) {
+function arrive(v, quiet) {
   v.state = 'parked';
-  v.m.root.position.set(G.layout.slotsX[v.slot], 0.02, parkZ(v));
+  v.m.root.position.set(G.layout.slotsX[v.slot], 0.05, parkZ(v));
   v.m.root.rotation.y = 0;
   v.a = 0;
-  v.label = makeLabel(`${v.filled}/${v.seats}`, { w: 1.05 });
-  v.label.position.set(0, v.m.roofY + 0.55, 0);
+  v.label = makeLabel(`${v.filled}/${v.seats}`, { w: 0.95 });
+  v.label.position.set(0, v.m.roofY + 0.45, 0);
   v.m.root.add(v.label);
   v.bounce = 1;
-  sfx.park();
+  if (!quiet) sfx.park();
+  updateMood();
 }
 
 function updateVehicles(dt) {
@@ -625,15 +668,14 @@ function updateVehicles(dt) {
         if (b.t >= 1) { v.state = 'lot'; b.dd = 0; }
       }
       const d = b.phase === 'fwd' ? b.d : b.dd;
-      m.root.position.set(v.x + f.x * d, 0.11, v.z + f.z * d);
+      m.root.position.set(v.x + f.x * d, 0.04, v.z + f.z * d);
       m.body.rotation.x = b.phase === 'back' ? Math.sin(b.t * Math.PI) * 0.08 : 0;
     } else if (v.state === 'drive') {
       const rem = v.path.total - v.s;
       v.speed = Math.min(14, v.speed + dt * 32, Math.sqrt(2 * 26 * Math.max(rem, 0)) + 1.2);
       v.s += v.speed * dt;
       const p = samplePath(v.path, v.s);
-      const inLot = Math.abs(p.x) < G.layout.hw && Math.abs(p.z) < G.layout.hh;
-      m.root.position.set(p.x, inLot ? 0.11 : 0.02, p.z);
+      m.root.position.set(p.x, 0.05, p.z);
       if (p.a !== null) {
         const prev = -m.root.rotation.y;
         const na = lerpAngle(prev, p.a, Math.min(1, dt * 14));
@@ -650,7 +692,7 @@ function updateVehicles(dt) {
       const F = v.fly;
       F.t = Math.min(1, F.t + dt / 1.0);
       const e = F.t < 0.5 ? 4 * F.t ** 3 : 1 - Math.pow(-2 * F.t + 2, 3) / 2;
-      m.root.position.set(F.from.x + (F.to.x - F.from.x) * e, 0.11 + Math.sin(F.t * Math.PI) * 3.2, F.from.z + (F.to.z - F.from.z) * e);
+      m.root.position.set(F.from.x + (F.to.x - F.from.x) * e, 0.05 + Math.sin(F.t * Math.PI) * 3, F.from.z + (F.to.z - F.from.z) * e);
       m.root.rotation.y = -lerpAngle(F.from.a, F.to.a, e);
       m.body.rotation.z = Math.sin(F.t * Math.PI * 4) * 0.08;
       if (F.t >= 1) arrive(v);
@@ -667,7 +709,7 @@ function updateVehicles(dt) {
       v.speed = Math.min(16, v.speed + dt * 22);
       v.s += v.speed * dt;
       const p = samplePath(v.path, v.s);
-      m.root.position.set(p.x, 0.02, p.z);
+      m.root.position.set(p.x, 0.05, p.z);
       if (p.a !== null) m.root.rotation.y = -lerpAngle(-m.root.rotation.y, p.a, Math.min(1, dt * 12));
       if (v.s >= v.path.total) {
         v.state = 'gone';
@@ -687,81 +729,31 @@ function depart(v) {
   v.m.body.scale.setScalar(1);
   sfx.full();
   setTimeout(() => sfx.depart(), 120);
-}
-
-// ---------------- Boarding ----------------
-let boardTimer = 0;
-function updateBoarding(dt) {
-  boardTimer -= dt;
-  while (boardTimer <= 0 && G.queue.length) {
-    const front = G.queue[0];
-    let target = null;
-    for (const v of G.vehicles) {
-      if (v.state !== 'parked' || v.color !== front.color) continue;
-      if (v.filled + v.incoming >= v.seats) continue;
-      if (!target || v.tapOrder < target.tapOrder) target = v;
-    }
-    if (!target) { boardTimer = 0; break; }
-    G.queue.shift();
-    target.incoming++;
-    if (!front.mesh) {
-      front.mesh = buildPassenger(COLORS[front.color].hex);
-      const p = queuePos(0);
-      front.mesh.position.set(p.x, 0.12, p.z);
-      G.root.add(front.mesh);
-    }
-    G.walkers.push({ p: front, v: target, walk: 0 });
-    boardTimer += 0.075;
-    syncQueueMeshes(false);
-  }
-  if (boardTimer < 0) boardTimer = 0;
-
-  for (let i = G.walkers.length - 1; i >= 0; i--) {
-    const w = G.walkers[i];
-    const m = w.p.mesh;
-    const tx = G.layout.slotsX[w.v.slot];
-    const tz = parkZ(w.v) - TYPES[w.v.type].len / 2 + 0.25;
-    const dx = tx - m.position.x, dz = tz - m.position.z;
-    const d = Math.hypot(dx, dz);
-    const step = 11 * dt;
-    w.walk += dt * 22;
-    if (d <= step) {
-      G.root.remove(m);
-      G.walkers.splice(i, 1);
-      w.v.incoming--;
-      w.v.filled++;
-      G.boarded++;
-      if (w.v.label) w.v.label.userData.draw(`${w.v.filled}/${w.v.seats}`);
-      w.v.bounce = Math.max(w.v.bounce || 0, 0.5);
-      sfx.board(w.v.filled);
-      updateProgress();
-    } else {
-      m.position.x += (dx / d) * step;
-      m.position.z += (dz / d) * step;
-      m.rotation.y = Math.atan2(dx, dz);
-      if (d < 0.6) m.scale.setScalar(Math.max(0.3, d / 0.6));
-      animatePerson(m, w.walk, dt);
-    }
-  }
+  updateMood();
 }
 
 // ---------------- Win / lose ----------------
+function peopleWaiting() {
+  return G.people.some((p) => p.mode === 'ring' || p.mode === 'arm');
+}
+
 function checkEnd(dt) {
   if (G.state !== 'playing') return;
-  const busy = G.vehicles.some((v) => v.state === 'drive' || v.state === 'fly' || v.state === 'bump' ||
-    (v.state === 'parked' && v.filled >= v.seats)) || G.walkers.length > 0;
-  if (!G.queue.length && !G.walkers.length && G.vehicles.every((v) => v.state === 'leave' || v.state === 'gone')) {
+  const waiting = peopleWaiting();
+  if (!waiting && !G.walkers.length && G.vehicles.every((v) => v.state === 'leave' || v.state === 'gone')) {
     G.winT += dt;
     if (G.winT > 0.9) win();
     return;
   }
-  if (busy || !G.queue.length || G.vip) { G.stuckT = 0; return; }
-  if (freeSlot() >= 0) { G.stuckT = 0; return; }
-  const c = G.queue[0].color;
-  const canBoard = G.vehicles.some((v) => v.state === 'parked' && v.color === c && v.filled + v.incoming < v.seats);
-  if (canBoard) { G.stuckT = 0; return; }
+  const busy = G.vehicles.some((v) => v.state === 'drive' || v.state === 'fly' || v.state === 'bump' ||
+    (v.state === 'parked' && v.filled >= v.seats)) || G.walkers.length > 0;
+  if (busy || !waiting || G.vip || freeSlot() >= 0) { G.stuckT = 0; return; }
+  // Spots are full. Stuck if nobody on the loop can board and the arms can't bring anyone new.
+  const canBoard = G.ring.cells.some((c) => c.some((p) => p && boardTarget(p.color)));
+  const armsCanFeed = G.ring.cells.some((c) => c.some((p) => !p)) && G.arms.some((a) => a.length);
+  if (canBoard || armsCanFeed) { G.stuckT = 0; return; }
   G.stuckT += dt;
-  if (G.stuckT > 0.7) lose();
+  if (G.stuckT > 1.2) lose();
 }
 
 function win() {
@@ -787,17 +779,14 @@ function lose() {
   G.state = 'lost';
   sfx.lose();
   buzz(200);
-  const canSpot = G.unlocked < G.maxSlots;
-  ui.loseSpot.style.display = canSpot ? '' : 'none';
+  ui.loseSpot.style.display = G.unlocked < G.maxSlots ? '' : 'none';
   ui.loseSpotPrice.textContent = `🪙 ${ECON.price.spot}`;
-  const canVip = save.unlocked.vip && !G.slots[G.layout.vipSlot];
-  ui.loseVip.style.display = canVip ? '' : 'none';
+  ui.loseVip.style.display = save.unlocked.vip && !G.slots[G.layout.vipSlot] ? '' : 'none';
   ui.loseVipPrice.textContent = save.boosters.vip > 0 ? `Free (${save.boosters.vip} left)` : `🪙 ${ECON.price.vip}`;
   show(ui.lose);
 }
 
 // ---------------- Boosters & purchases ----------------
-// Uses a free booster if there is one, otherwise takes coins. Returns false if neither.
 function payFor(kind) {
   if (kind !== 'spot' && save.boosters[kind] > 0) { save.boosters[kind]--; persist(); return true; }
   const price = ECON.price[kind];
@@ -806,33 +795,30 @@ function payFor(kind) {
   sfx.coin();
   return true;
 }
-function costText(kind) {
-  if (kind !== 'spot' && save.boosters[kind] > 0) return `free (${save.boosters[kind]} left)`;
-  return `🪙 ${ECON.price[kind]}`;
-}
 function canAfford(kind) {
   return (kind !== 'spot' && save.boosters[kind] > 0) || save.coins >= ECON.price[kind];
 }
 
 let buyAction = null;
-function askToBuy(title, text, action) {
+function askToBuy(title, text, okText, action) {
   ui.buyTitle.textContent = title;
   ui.buyText.textContent = text;
+  ui.buyOk.textContent = okText;
   buyAction = action;
   show(ui.buy);
 }
 ui.buyOk.addEventListener('click', () => { hide(ui.buy); const a = buyAction; buyAction = null; if (a) a(); });
 ui.buyCancel.addEventListener('click', () => { hide(ui.buy); buyAction = null; });
 function notEnough(kind) {
-  askToBuy('Not enough coins', `This costs 🪙 ${ECON.price[kind]} and you have 🪙 ${save.coins}. Win levels to earn more coins.`, null);
-  ui.buyOk.textContent = 'OK';
+  askToBuy('Not enough coins', `This costs 🪙 ${ECON.price[kind]} and you have 🪙 ${save.coins}. Win levels to earn more coins.`, 'OK', null);
 }
 
-const NAMES = { spot: 'Extra Spot', shuffle: 'Shuffle', vip: 'VIP' };
+const NAMES = { spot: 'Extra Spot', vip: 'VIP', arrange: 'Arrange', jumble: 'Jumble' };
 const INFO = {
   spot: 'Opens one more parking spot for this level.',
-  shuffle: 'Mixes up the colors of every vehicle still in the parking lot.',
   vip: 'Lifts any vehicle, even a blocked one, into the VIP spot.',
+  arrange: 'Everyone who matches a parked vehicle hops straight on, wherever they are in line.',
+  jumble: 'Mixes up the colors of every vehicle still in the parking lot.',
 };
 
 function requestBooster(kind) {
@@ -841,13 +827,13 @@ function requestBooster(kind) {
   if (kind !== 'spot' && !save.unlocked[kind]) { toast(`Unlocks at level ${ECON.unlockLevel[kind]}`); return; }
   if (kind === 'vip' && G.vip) { cancelVip(); toast('VIP cancelled'); return; }
   if (kind === 'spot' && G.unlocked >= G.maxSlots) { toast('All extra spots are open'); return; }
-  if (kind === 'shuffle' && G.vehicles.filter((v) => v.state === 'lot').length < 2) { toast('Nothing left to shuffle'); return; }
+  if (kind === 'jumble' && G.vehicles.filter((v) => v.state === 'lot').length < 2) { toast('Nothing left to jumble'); return; }
   if (kind === 'vip' && G.slots[G.layout.vipSlot]) { toast('The VIP spot is busy'); return; }
+  if (kind === 'arrange' && !arrangeTargets().length) { toast('Park a vehicle first, then Arrange'); return; }
   if (!canAfford(kind)) { notEnough(kind); return; }
   const go = () => applyBooster(kind);
   if (kind !== 'spot' && save.boosters[kind] > 0) { go(); return; }
-  ui.buyOk.textContent = `Buy 🪙 ${ECON.price[kind]}`;
-  askToBuy(NAMES[kind], INFO[kind], go);
+  askToBuy(NAMES[kind], INFO[kind], `Buy 🪙 ${ECON.price[kind]}`, go);
 }
 
 function applyBooster(kind) {
@@ -856,9 +842,12 @@ function applyBooster(kind) {
     if (G.unlocked >= G.maxSlots || !payFor('spot')) return;
     unlockSlot();
     if (G.state === 'lost') { G.state = 'playing'; hide(ui.lose); }
-  } else if (kind === 'shuffle') {
-    if (!payFor('shuffle')) return;
-    shuffleLot();
+  } else if (kind === 'jumble') {
+    if (!payFor('jumble')) return;
+    jumbleLot();
+  } else if (kind === 'arrange') {
+    if (!payFor('arrange')) return;
+    arrange();
   } else if (kind === 'vip') {
     // Paid when the vehicle is picked, so cancelling costs nothing.
     G.vip = true;
@@ -875,7 +864,34 @@ function cancelVip() {
   ui.boosters.querySelector('[data-booster="vip"]').classList.remove('active');
 }
 
-function shuffleLot() {
+// Passengers anywhere in line who match a parked vehicle with room.
+function arrangeTargets() {
+  const room = new Map();
+  for (const v of G.vehicles) {
+    if (v.state === 'parked') room.set(v.color, (room.get(v.color) || 0) + v.seats - v.filled - v.incoming);
+  }
+  const out = [];
+  const take = (p) => {
+    const r = room.get(p.color) || 0;
+    if (r > 0) { room.set(p.color, r - 1); out.push(p); }
+  };
+  G.ring.cells.forEach((c) => c.forEach((p) => p && take(p)));
+  G.arms.forEach((a) => a.forEach(take));
+  return out;
+}
+
+function arrange() {
+  for (const p of arrangeTargets()) {
+    if (p.mode === 'ring') {
+      for (const cell of G.ring.cells) { const l = cell.indexOf(p); if (l >= 0) { cell[l] = null; break; } }
+    } else {
+      for (const arm of G.arms) { const i = arm.indexOf(p); if (i >= 0) { arm.splice(i, 1); break; } }
+    }
+    startWalk(p, boardTarget(p.color));
+  }
+}
+
+function jumbleLot() {
   const lot = G.vehicles.filter((v) => v.state === 'lot');
   // Colors only swap between vehicles of the same size, so every color keeps its seat count.
   for (const type of Object.keys(TYPES)) {
@@ -886,7 +902,6 @@ function shuffleLot() {
       [cols[i], cols[j]] = [cols[j], cols[i]];
     }
     group.forEach((v, i) => {
-      v.bounce = 1;
       v.shake = 0.6;
       if (v.color === cols[i]) return;
       const from = new THREE.Color(v.m.paint.color.getHex());
@@ -897,8 +912,14 @@ function shuffleLot() {
 }
 
 function unlockSlot() {
+  const slot = G.unlocked;
   G.unlocked++;
-  buildLockTiles();
+  const bay = G.bays.find((b) => b.slotIndex === slot && !b.isVip);
+  if (bay) {
+    bay.frame.material.color.set(0xa3a7b6);
+    if (bay.mark) { bay.mark.parent.remove(bay.mark); bay.mark = null; }
+    bay.locked = false;
+  }
   G.stuckT = 0;
   updateHud();
 }
@@ -910,17 +931,10 @@ function updateHud() {
   ui.levelLabel.textContent = `Level ${G.n}`;
   ui.levelBadge.textContent = kind === 'hard' ? 'HARD' : kind === 'super' ? 'SUPER HARD' : '';
   ui.levelBadge.className = `badge ${kind}`;
-  ui.coinCount.textContent = save.coins;
-  ui.homeCoins.textContent = save.coins;
+  showCoins();
   for (const btn of ui.boosters.querySelectorAll('[data-booster]')) {
     const k = btn.dataset.booster;
     const count = btn.querySelector('.count');
-    if (k === 'spot') {
-      const full = G.unlocked >= G.maxSlots;
-      count.textContent = full ? 'MAX' : `🪙${ECON.price.spot}`;
-      count.className = full ? 'count lock' : 'count price';
-      continue;
-    }
     const locked = !save.unlocked[k];
     btn.classList.toggle('locked', locked);
     if (locked) { count.textContent = `Lv ${ECON.unlockLevel[k]}`; count.className = 'count lock'; continue; }
@@ -928,11 +942,15 @@ function updateHud() {
     count.textContent = c > 0 ? c : `🪙${ECON.price[k]}`;
     count.className = c > 0 ? 'count' : 'count price';
   }
-  updateProgress();
+  updateMood();
 }
-function updateProgress() {
+// The face in the corner reacts to how full the parking spots are.
+function updateMood() {
   if (!G) return;
-  ui.progressFill.style.width = `${(100 * G.boarded) / Math.max(1, G.total)}%`;
+  let used = 0;
+  for (let i = 0; i < G.unlocked; i++) if (G.slots[i]) used++;
+  const free = G.unlocked - used;
+  ui.mood.textContent = free >= 3 ? '😄' : free === 2 ? '🙂' : free === 1 ? '😟' : '😰';
 }
 
 let toastTimer = 0;
@@ -940,9 +958,8 @@ function toast(msg) {
   ui.toast.textContent = msg;
   ui.toast.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => ui.toast.classList.remove('show'), 1600);
+  toastTimer = setTimeout(() => ui.toast.classList.remove('show'), 1700);
 }
-
 function show(el) { el.classList.add('show'); }
 function hide(el) { el.classList.remove('show'); }
 
@@ -955,7 +972,6 @@ function confetti() {
     p.style.background = colors[i % colors.length];
     p.style.animationDelay = `${Math.random() * 0.6}s`;
     p.style.animationDuration = `${1.8 + Math.random() * 1.4}s`;
-    p.style.transform = `rotate(${Math.random() * 360}deg)`;
     ui.confetti.appendChild(p);
   }
   setTimeout(() => { ui.confetti.innerHTML = ''; }, 3600);
@@ -963,25 +979,26 @@ function confetti() {
 
 // Tutorial hand on early levels: points at a good vehicle to tap.
 function bestHintVehicle() {
-  const front = G.queue[0];
+  const want = new Set();
+  G.ring.cells.forEach((c) => c.forEach((p) => p && want.add(p.color)));
   const free = G.vehicles.filter((v) => v.state === 'lot' && blockInfo(v).dist === Infinity);
-  return (front && free.find((v) => v.color === front.color && !v.mystery)) || free[0] || null;
+  return free.find((v) => want.has(v.color) && !v.mystery) || free[0] || null;
 }
 function showTutorial() {
   ui.tutorial.classList.remove('show');
+  G.hintOn = false;
   if (G.n === 1) {
-    ui.tutText.textContent = 'Tap a bus that matches the passengers’ color. It drives to a parking spot and they hop on!';
+    ui.tutText.textContent = 'Tap a vehicle to send it to a parking spot. Passengers of the same color hop on as they pass the gate!';
     ui.tutorial.classList.add('show');
     G.hintOn = true;
   } else if (G.n === 2) {
-    ui.tutText.textContent = 'Buses only drive the way their arrow points. Clear the way first!';
+    ui.tutText.textContent = 'Vehicles only drive the way their arrow points. Clear the way first!';
     ui.tutorial.classList.add('show');
     G.hintOn = true;
   } else if (G.n === 3) {
-    ui.tutText.textContent = `Need more room? Tap a yellow locked spot to open it for 🪙${ECON.price.spot} (this level only).`;
+    ui.tutText.textContent = `Need more room? Tap a green + spot to open it for 🪙${ECON.price.spot} (this level only).`;
     ui.tutorial.classList.add('show');
-    G.hintOn = false;
-  } else G.hintOn = false;
+  }
   if (G.level.vehicles.some((v) => v.mystery) && !save.seenTips.mystery) {
     save.seenTips.mystery = true;
     persist();
@@ -992,7 +1009,7 @@ function showTutorial() {
     save.seenTips.hard = true;
     persist();
     ui.tipTitle.textContent = 'Hard level!';
-    ui.tipText.textContent = 'There is less room for mistakes. Watch the line of passengers and plan your moves.';
+    ui.tipText.textContent = 'There is less room for mistakes. Watch the colors on the loop and plan your moves.';
     show(ui.tip);
   }
 }
@@ -1004,7 +1021,7 @@ function updateHint() {
   const busy = G.vehicles.some((v) => v.state === 'drive' || v.state === 'bump');
   const v = busy ? null : bestHintVehicle();
   if (!v || freeSlot() < 0) { ui.hand.style.display = 'none'; return; }
-  const p = new THREE.Vector3(v.x, 0.9, v.z).project(camera);
+  const p = new THREE.Vector3(v.x, 0.6, v.z).project(camera);
   ui.hand.style.display = 'block';
   ui.hand.style.left = `${((p.x + 1) / 2) * window.innerWidth}px`;
   ui.hand.style.top = `${((1 - p.y) / 2) * window.innerHeight}px`;
@@ -1014,7 +1031,7 @@ function updateHint() {
 let down = null;
 canvas.addEventListener('pointerdown', (e) => {
   unlockAudio();
-  down = { x: e.clientX, y: e.clientY, t: performance.now() };
+  down = { x: e.clientX, y: e.clientY };
 });
 canvas.addEventListener('pointerup', (e) => {
   if (!down || !G) return;
@@ -1024,12 +1041,12 @@ canvas.addEventListener('pointerup', (e) => {
   const ndc = new THREE.Vector2((e.clientX / window.innerWidth) * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   const targets = G.vehicles.filter((v) => v.state === 'lot').map((v) => v.m.hit);
-  for (const t of G.lockTiles) targets.push(t.userData.plate);
+  for (const h of G.bayHits) if (h.userData.slot >= G.unlocked) targets.push(h);
   const hits = raycaster.intersectObjects(targets, false);
   if (!hits.length) return;
   const o = hits[0].object;
   if (o.userData.vehicle) tapVehicle(o.userData.vehicle);
-  else if (o.userData.lockedSlot !== undefined) requestBooster('spot');
+  else if (o.userData.slot !== undefined) requestBooster('spot');
 });
 
 ui.boosters.addEventListener('click', (e) => {
@@ -1042,19 +1059,13 @@ ui.boosters.addEventListener('click', (e) => {
 ui.playBtn.addEventListener('click', () => {
   unlockAudio();
   sfx.tap();
-  hide(ui.home);
-  ui.hud.classList.add('show');
   askPersistentStorage();
   const run = readRun();
   startLevel(save.level, run && run.n === save.level ? run : null);
 });
 ui.levelsBtn.addEventListener('click', () => { unlockAudio(); sfx.tap(); openLevels(); });
 ui.levelsClose.addEventListener('click', () => hide(ui.levels));
-ui.winNext.addEventListener('click', () => {
-  sfx.tap();
-  hide(ui.win);
-  startLevel(Math.min(G.n + 1, MAX_LEVEL));
-});
+ui.winNext.addEventListener('click', () => { sfx.tap(); hide(ui.win); startLevel(Math.min(G.n + 1, MAX_LEVEL)); });
 ui.loseRetry.addEventListener('click', () => { sfx.tap(); hide(ui.lose); clearRun(); startLevel(G.n); });
 ui.loseSpot.addEventListener('click', () => {
   if (save.coins < ECON.price.spot) { notEnough('spot'); return; }
@@ -1064,11 +1075,27 @@ ui.loseVip.addEventListener('click', () => {
   if (!canAfford('vip')) { notEnough('vip'); return; }
   hide(ui.lose);
   G.state = 'playing';
-  G.stuckT = -2; // give the player time to pick a vehicle
   applyBooster('vip');
 });
-ui.settingsBtn.addEventListener('click', () => { sfx.tap(); renderSettings(); show(ui.settings); });
-ui.settingsClose.addEventListener('click', () => hide(ui.settings));
+ui.restartTop.addEventListener('click', () => {
+  if (!G || G.state === 'menu') return;
+  unlockAudio();
+  sfx.tap();
+  clearRun();
+  startLevel(G.n);
+});
+function openPause() {
+  if (G && G.state === 'playing') G.state = 'paused';
+  renderSettings();
+  show(ui.settings);
+}
+function closePause() {
+  hide(ui.settings);
+  if (G && G.state === 'paused') G.state = 'playing';
+}
+ui.pauseBtn.addEventListener('click', () => { unlockAudio(); sfx.tap(); openPause(); });
+ui.homeSettings.addEventListener('click', () => { unlockAudio(); sfx.tap(); openPause(); });
+ui.settingsClose.addEventListener('click', closePause);
 ui.soundToggle.addEventListener('click', () => {
   save.sound = !save.sound;
   setSoundEnabled(save.sound);
@@ -1089,9 +1116,11 @@ ui.vibeToggle.addEventListener('click', () => {
   renderSettings();
   buzz(30);
 });
-ui.homeSettings.addEventListener('click', () => { unlockAudio(); sfx.tap(); renderSettings(); show(ui.settings); });
-ui.restartBtn.addEventListener('click', () => { hide(ui.settings); clearRun(); startLevel(G.n); });
-ui.homeBtn.addEventListener('click', () => { hide(ui.settings); saveRun(); goHome(); });
+ui.homeBtn.addEventListener('click', () => {
+  saveRun();
+  hide(ui.settings);
+  goHome();
+});
 let resetArmed = false;
 ui.resetBtn.addEventListener('click', () => {
   if (!resetArmed) {
@@ -1107,22 +1136,18 @@ ui.resetBtn.addEventListener('click', () => {
 });
 ui.tipOk.addEventListener('click', () => hide(ui.tip));
 
-// Move progress between Safari and the Home Screen app.
-const $ = (id) => document.getElementById(id);
 $('transferBtn').addEventListener('click', () => {
   saveRun();
   persist();
   $('myCode').value = progressCode();
   $('pasteCode').value = '';
-  hide(ui.settings);
   show($('transfer'));
 });
 $('transferClose').addEventListener('click', () => hide($('transfer')));
 $('copyCode').addEventListener('click', () => {
   const box = $('myCode');
-  const done = () => toast('Code copied');
   const fallback = () => { box.focus(); box.select(); box.setSelectionRange(0, box.value.length); toast('Code selected, tap Copy'); };
-  try { navigator.clipboard.writeText(box.value).then(done, fallback); } catch (e) { fallback(); }
+  try { navigator.clipboard.writeText(box.value).then(() => toast('Code copied'), fallback); } catch (e) { fallback(); }
 });
 $('loadCode').addEventListener('click', () => {
   try {
@@ -1140,24 +1165,24 @@ function renderSettings() {
   ui.musicToggle.textContent = save.music ? 'Music: On 🎵' : 'Music: Off';
   ui.vibeToggle.textContent = save.vibrate ? 'Vibration: On 📳' : 'Vibration: Off';
   ui.vibeToggle.style.display = canVibrate ? '' : 'none';
-  ui.restartBtn.style.display = ui.hud.classList.contains('show') ? '' : 'none';
-  ui.homeBtn.style.display = ui.hud.classList.contains('show') ? '' : 'none';
+  const inGame = ui.hud.classList.contains('show');
+  ui.homeBtn.style.display = inGame ? '' : 'none';
+  ui.settingsClose.textContent = inGame ? 'Resume' : 'Done';
+  showCoins();
 }
 
 function startLevel(n, run = null) {
-  hide(ui.win); hide(ui.lose); hide(ui.levels); hide(ui.home); hide(ui.buy);
+  for (const el of [ui.win, ui.lose, ui.levels, ui.home, ui.buy, ui.settings]) hide(el);
   ui.hud.classList.add('show');
   ui.vipBanner.classList.remove('show');
   ui.boosters.querySelector('[data-booster="vip"]').classList.remove('active');
-  boardTimer = 0;
   runSaveT = 0;
   loadLevel(n, run);
   checkBoosterUnlocks();
 }
 
-// New boosters unlock at set levels and come with free uses.
 function checkBoosterUnlocks() {
-  for (const k of ['shuffle', 'vip']) {
+  for (const k of ['jumble', 'arrange', 'vip']) {
     if (!save.unlocked[k] && G.n >= ECON.unlockLevel[k]) {
       save.unlocked[k] = true;
       save.boosters[k] += ECON.freeOnUnlock;
@@ -1176,11 +1201,13 @@ function goHome() {
   ui.tutorial.classList.remove('show');
   ui.hand.style.display = 'none';
   const run = readRun();
-  ui.homeLevel.textContent = run && run.n === save.level ? `Continue Level ${save.level}` : `Level ${save.level}`;
-  ui.homeCoins.textContent = save.coins;
-  loadLevel(save.level);
+  const resume = run && run.n === save.level ? run : null;
+  ui.homeLevel.textContent = resume ? `Continue Level ${save.level}` : `Level ${save.level}`;
+  showCoins();
+  loadLevel(save.level, resume);
   G.state = 'menu';
   ui.tutorial.classList.remove('show');
+  hide(ui.tip);
   show(ui.home);
 }
 
@@ -1204,23 +1231,26 @@ function openLevels() {
 }
 
 // ---------------- Main loop ----------------
+function step(dt) {
+  G.time += dt;
+  if (G.state === 'playing' || G.state === 'won') {
+    if (G.state === 'playing') {
+      runSaveT += dt;
+      if (runSaveT > 0.5) { runSaveT = 0; saveRun(); }
+    }
+    updateVehicles(dt);
+    updateCrowd(dt);
+    checkEnd(dt);
+    updateHint();
+  } else if (G.state === 'menu') {
+    updateCrowd(dt);
+  }
+}
 let last = performance.now();
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
-  if (G) {
-    G.time += dt;
-    if (G.state === 'playing' || G.state === 'won') {
-      if (G.state === 'playing') tickRunSave(dt);
-      updateVehicles(dt);
-      updateBoarding(dt);
-      updateQueue(dt);
-      checkEnd(dt);
-      updateHint();
-    } else if (G.state === 'menu') {
-      updateQueue(dt);
-    }
-  }
+  if (G) step(dt);
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
@@ -1230,8 +1260,8 @@ requestAnimationFrame(frame);
 
 // Test hooks used by the automated play-tester.
 window.__bp = {
-  get G() { return G; }, tapVehicle, requestBooster, applyBooster, startLevel, blockInfo, freeSlot, save, ECON, saveRun, readRun,
-  step(dt) { G.time += dt; updateVehicles(dt); updateBoarding(dt); updateQueue(dt); checkEnd(dt); },
+  get G() { return G; }, tapVehicle, requestBooster, applyBooster, startLevel, blockInfo, freeSlot, save, ECON,
+  saveRun, readRun, step,
 };
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {

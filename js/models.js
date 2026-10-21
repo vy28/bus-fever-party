@@ -1,244 +1,208 @@
 import * as THREE from './vendor/three.module.min.js';
 import { RoundedBoxGeometry } from './vendor/RoundedBoxGeometry.js';
-import { TYPES } from './levels.js';
+import { mergeGeometries } from './vendor/BufferGeometryUtils.js';
+import { TYPES, ROW_HALF_W } from './levels.js';
+import { TRACK_W, laneOffset, PER_RANK } from './track.js';
 
+export const MYSTERY_HEX = 0x9aa3b2;
+
+// ---------- Geometry helpers ----------
 const geoCache = new Map();
 function cached(key, make) {
   if (!geoCache.has(key)) geoCache.set(key, make());
   return geoCache.get(key);
 }
 function rbox(w, h, d, r, seg = 3) {
-  return cached(`rb${w},${h},${d},${r},${seg}`, () => new RoundedBoxGeometry(w, h, d, seg, r));
+  return new RoundedBoxGeometry(w, h, d, seg, Math.min(r, w / 2 - 0.001, h / 2 - 0.001, d / 2 - 0.001));
 }
-function box(w, h, d) {
-  return cached(`b${w},${h},${d}`, () => new THREE.BoxGeometry(w, h, d));
-}
-
-const mats = {
-  glass: new THREE.MeshStandardMaterial({ color: 0x1d2b40, roughness: 0.12, metalness: 0.55 }),
-  tire: new THREE.MeshStandardMaterial({ color: 0x1b1d22, roughness: 0.85 }),
-  hub: new THREE.MeshStandardMaterial({ color: 0xd9dde3, roughness: 0.35, metalness: 0.6 }),
-  chassis: new THREE.MeshStandardMaterial({ color: 0x2a2e36, roughness: 0.7 }),
-  white: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 }),
-  head: new THREE.MeshStandardMaterial({ color: 0xfff6c8, emissive: 0xfff1a8, emissiveIntensity: 0.6, roughness: 0.3 }),
-  tail: new THREE.MeshStandardMaterial({ color: 0xff3b3b, emissive: 0xff2020, emissiveIntensity: 0.4, roughness: 0.3 }),
-  skin: new THREE.MeshStandardMaterial({ color: 0xffd3ad, roughness: 0.7 }),
-  hair: new THREE.MeshStandardMaterial({ color: 0x3a2a20, roughness: 0.8 }),
-  shadowBlob: new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.18, depthWrite: false }),
-};
-
-export const MYSTERY_HEX = 0x9aa3b2;
-
-function arrowGeometry() {
-  return cached('arrow', () => {
-    const s = new THREE.Shape();
-    s.moveTo(-0.13, -0.5);
-    s.lineTo(0.13, -0.5);
-    s.lineTo(0.13, 0.05);
-    s.lineTo(0.32, 0.05);
-    s.lineTo(0, 0.5);
-    s.lineTo(-0.32, 0.05);
-    s.lineTo(-0.13, 0.05);
-    s.closePath();
-    const g = new THREE.ExtrudeGeometry(s, { depth: 0.035, bevelEnabled: true, bevelThickness: 0.012, bevelSize: 0.02, bevelSegments: 2 });
-    g.rotateX(-Math.PI / 2);
-    return g;
-  });
+// Bakes a transform and a vertex color into a geometry so parts can be merged.
+function part(geo, x, y, z, color, rx = 0, ry = 0, rz = 0) {
+  const g = geo.index ? geo.toNonIndexed() : geo.clone();
+  g.deleteAttribute('uv');
+  const m = new THREE.Matrix4().compose(new THREE.Vector3(x, y, z), new THREE.Quaternion().setFromEuler(new THREE.Euler(rx, ry, rz)), new THREE.Vector3(1, 1, 1));
+  g.applyMatrix4(m);
+  const c = new THREE.Color(color);
+  const n = g.attributes.position.count;
+  const arr = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { arr[i * 3] = c.r; arr[i * 3 + 1] = c.g; arr[i * 3 + 2] = c.b; }
+  g.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+  return g;
 }
 
-function wheelGeometry() {
-  return cached('wheel', () => {
-    const g = new THREE.CylinderGeometry(0.2, 0.2, 0.16, 18);
-    g.rotateZ(Math.PI / 2);
-    return g;
-  });
+function arrowShape() {
+  const s = new THREE.Shape();
+  s.moveTo(-0.11, -0.5);
+  s.lineTo(0.11, -0.5);
+  s.lineTo(0.11, 0.02);
+  s.lineTo(0.3, 0.02);
+  s.lineTo(0, 0.5);
+  s.lineTo(-0.3, 0.02);
+  s.lineTo(-0.11, 0.02);
+  s.closePath();
+  return s;
 }
-function hubGeometry() {
-  return cached('hub', () => {
-    const g = new THREE.CylinderGeometry(0.1, 0.1, 0.17, 12);
-    g.rotateZ(Math.PI / 2);
-    return g;
-  });
+function arrowGeo(scaleX, scaleZ) {
+  const g = new THREE.ExtrudeGeometry(arrowShape(), { depth: 0.03, bevelEnabled: true, bevelThickness: 0.01, bevelSize: 0.018, bevelSegments: 1 });
+  g.rotateX(-Math.PI / 2);
+  g.scale(scaleX, 1, scaleZ);
+  return g;
 }
 
-function addWheels(group, wid, zs) {
-  for (const z of zs) {
+// ---------- Vehicles ----------
+// Each vehicle is two merged meshes: `paint` (tinted by a per-vehicle material, so colors can
+// change) and `detail` (glass, wheels, lights and the roof arrow, shared material).
+const paintGeoCache = new Map();
+const detailGeoCache = new Map();
+const detailMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.45, metalness: 0.05 });
+
+function vehicleGeometries(type) {
+  if (paintGeoCache.has(type)) return { paint: paintGeoCache.get(type), detail: detailGeoCache.get(type) };
+  const { len: L, wid: W } = TYPES[type];
+  const paint = [];
+  const detail = [];
+  const GLASS = 0xcfe3f5, TIRE = 0x2b2d35, HUB = 0xe9edf2, HEAD = 0xfff4c2, TAIL = 0xff5a5a, WHITE = 0xffffff;
+  const shade = (f) => new THREE.Color(f, f, f);
+
+  if (type === 'bus' || type === 'van') {
+    const H = type === 'bus' ? 0.62 : 0.6;
+    paint.push(part(rbox(W, H, L, 0.2), 0, 0.12 + H / 2, 0, shade(1)));
+    // Window band, with the body color showing between windows.
+    paint.push(part(rbox(W + 0.02, 0.07, L + 0.02, 0.03), 0, 0.22, 0, shade(0.82)));
+    const winY = 0.12 + H * 0.66;
+    detail.push(part(rbox(W + 0.025, 0.17, L - 0.32, 0.06), 0, winY, 0.06, GLASS));
+    detail.push(part(rbox(W - 0.22, 0.2, 0.05, 0.02), 0, winY, -L / 2 + 0.005, GLASS));
+    const nWin = type === 'bus' ? 5 : 3;
+    for (let i = 1; i < nWin; i++) {
+      const z = -L / 2 + 0.16 + 0.06 + (i * (L - 0.32)) / nWin;
+      paint.push(part(new THREE.BoxGeometry(W + 0.04, 0.17, 0.05), 0, winY, z, shade(1)));
+    }
+    // Roof: same color, a touch lighter, with a raised rim.
+    paint.push(part(rbox(W - 0.1, 0.06, L - 0.16, 0.03), 0, 0.12 + H + 0.02, 0, shade(1.12)));
     for (const sx of [-1, 1]) {
-      const w = new THREE.Mesh(wheelGeometry(), mats.tire);
-      w.position.set(sx * (wid / 2 - 0.06), 0.2, z);
-      w.castShadow = true;
-      group.add(w);
-      const h = new THREE.Mesh(hubGeometry(), mats.hub);
-      h.position.copy(w.position);
-      h.position.x += sx * 0.005;
-      group.add(h);
+      detail.push(part(new THREE.BoxGeometry(0.16, 0.08, 0.03), sx * (W / 2 - 0.17), 0.3, -L / 2 - 0.005, HEAD));
+      detail.push(part(new THREE.BoxGeometry(0.14, 0.08, 0.03), sx * (W / 2 - 0.16), 0.3, L / 2 + 0.005, TAIL));
+    }
+    detail.push(part(arrowGeo(0.95 * W, type === 'bus' ? 1.25 : 1.0), 0, 0.12 + H + 0.055, 0, WHITE));
+  } else {
+    paint.push(part(rbox(W, 0.36, L, 0.15), 0, 0.3, 0, shade(1)));
+    paint.push(part(rbox(W + 0.02, 0.06, L + 0.02, 0.03), 0, 0.17, 0, shade(0.82)));
+    detail.push(part(rbox(W - 0.12, 0.24, L * 0.58, 0.1), 0, 0.56, 0.04, GLASS));
+    paint.push(part(rbox(W - 0.14, 0.06, L * 0.5, 0.03), 0, 0.69, 0.04, shade(1.12)));
+    for (const sx of [-1, 1]) {
+      detail.push(part(new THREE.BoxGeometry(0.15, 0.07, 0.03), sx * (W / 2 - 0.17), 0.33, -L / 2 - 0.005, HEAD));
+      detail.push(part(new THREE.BoxGeometry(0.13, 0.07, 0.03), sx * (W / 2 - 0.16), 0.33, L / 2 + 0.005, TAIL));
+    }
+    detail.push(part(arrowGeo(0.72, 0.62), 0, 0.73, 0.04, WHITE));
+  }
+  const wheel = new THREE.CylinderGeometry(0.13, 0.13, 0.1, 14);
+  const hub = new THREE.CylinderGeometry(0.06, 0.06, 0.11, 10);
+  const wz = L / 2 - (type === 'car' ? 0.3 : 0.42);
+  for (const z of [-wz, wz]) {
+    for (const sx of [-1, 1]) {
+      detail.push(part(wheel, sx * (W / 2 - 0.04), 0.13, z, TIRE, 0, 0, Math.PI / 2));
+      detail.push(part(hub, sx * (W / 2 - 0.035), 0.13, z, HUB, 0, 0, Math.PI / 2));
     }
   }
+  const p = mergeGeometries(paint);
+  const d = mergeGeometries(detail);
+  paintGeoCache.set(type, p);
+  detailGeoCache.set(type, d);
+  return { paint: p, detail: d };
 }
 
-function lights(group, wid, len, y) {
-  for (const sx of [-1, 1]) {
-    const hl = new THREE.Mesh(box(0.2, 0.1, 0.04), mats.head);
-    hl.position.set(sx * (wid / 2 - 0.2), y, -len / 2 - 0.005);
-    group.add(hl);
-    const tl = new THREE.Mesh(box(0.18, 0.1, 0.04), mats.tail);
-    tl.position.set(sx * (wid / 2 - 0.18), y, len / 2 + 0.005);
-    group.add(tl);
-  }
-}
+const blobMat = new THREE.MeshBasicMaterial({ color: 0x3a3550, transparent: true, opacity: 0.12, depthWrite: false });
 
-function shade(hex, f) {
-  const c = new THREE.Color(hex);
-  if (f > 1) c.lerp(new THREE.Color(0xffffff), f - 1);
-  else c.multiplyScalar(f);
-  return c;
-}
-
-// Builds a vehicle. Root sits on the ground at its centre and faces -z.
-// `body` is the sub-group that wobbles; `paint` holds the recolourable materials.
+// Root sits on the ground at the vehicle's centre and faces -z.
 export function buildVehicle(type, hex) {
   const t = TYPES[type];
-  const L = t.len, W = t.wid;
   const root = new THREE.Group();
   const body = new THREE.Group();
   root.add(body);
-  const paint = new THREE.MeshStandardMaterial({ color: hex, roughness: 0.38, metalness: 0.05 });
-  const roofPaint = new THREE.MeshStandardMaterial({ color: shade(hex, 1.18), roughness: 0.42 });
-  const trimPaint = new THREE.MeshStandardMaterial({ color: shade(hex, 0.72), roughness: 0.5 });
-
-  const blob = new THREE.Mesh(cached(`blob${L}`, () => {
-    const g = new THREE.PlaneGeometry(W + 0.35, L + 0.35);
+  const geos = vehicleGeometries(type);
+  const paintMat = new THREE.MeshStandardMaterial({ color: hex, vertexColors: true, roughness: 0.42, metalness: 0.02 });
+  const paintMesh = new THREE.Mesh(geos.paint, paintMat);
+  const detailMesh = new THREE.Mesh(geos.detail, detailMat);
+  paintMesh.castShadow = true;
+  detailMesh.castShadow = false;
+  body.add(paintMesh, detailMesh);
+  const blob = new THREE.Mesh(cached(`blob${type}`, () => {
+    const g = new THREE.PlaneGeometry(t.wid + 0.2, t.len + 0.2);
     g.rotateX(-Math.PI / 2);
     return g;
-  }), mats.shadowBlob);
-  blob.position.y = 0.012;
+  }), blobMat);
+  blob.position.y = 0.01;
   root.add(blob);
-
-  const chassis = new THREE.Mesh(rbox(W - 0.06, 0.2, L - 0.1, 0.06), mats.chassis);
-  chassis.position.y = 0.2;
-  body.add(chassis);
-
-  let roofY;
-  if (type === 'bus') {
-    const lower = new THREE.Mesh(rbox(W, 0.36, L, 0.12), paint);
-    lower.position.y = 0.42;
-    const glass = new THREE.Mesh(rbox(W + 0.025, 0.3, L + 0.025, 0.1), mats.glass);
-    glass.position.y = 0.72;
-    const upper = new THREE.Mesh(rbox(W, 0.14, L, 0.07), paint);
-    upper.position.y = 0.92;
-    const stripe = new THREE.Mesh(rbox(W + 0.03, 0.07, L + 0.03, 0.03), trimPaint);
-    stripe.position.y = 0.36;
-    body.add(lower, glass, upper, stripe);
-    // Window pillars.
-    const n = 5;
-    for (let i = 0; i < n; i++) {
-      const z = -L / 2 + 0.75 + (i * (L - 1.2)) / (n - 1);
-      const pil = new THREE.Mesh(box(W + 0.04, 0.3, 0.07), paint);
-      pil.position.set(0, 0.72, z);
-      body.add(pil);
-    }
-    roofY = 0.99;
-    const roof = new THREE.Mesh(rbox(W - 0.12, 0.07, L - 0.3, 0.03), roofPaint);
-    roof.position.y = roofY + 0.02;
-    body.add(roof);
-    roofY += 0.055;
-    addWheels(body, W, [-L / 2 + 0.6, L / 2 - 0.62]);
-    lights(body, W, L, 0.36);
-  } else if (type === 'van') {
-    const lower = new THREE.Mesh(rbox(W, 0.36, L, 0.12), paint);
-    lower.position.y = 0.42;
-    const glass = new THREE.Mesh(rbox(W + 0.02, 0.28, L - 0.38, 0.1), mats.glass);
-    glass.position.set(0, 0.72, 0.17);
-    const upper = new THREE.Mesh(rbox(W, 0.14, L - 0.4, 0.07), paint);
-    upper.position.set(0, 0.91, 0.18);
-    const stripe = new THREE.Mesh(rbox(W + 0.03, 0.07, L + 0.03, 0.03), trimPaint);
-    stripe.position.y = 0.36;
-    body.add(lower, glass, upper, stripe);
-    for (const z of [-0.1, 0.55]) {
-      const pil = new THREE.Mesh(box(W + 0.03, 0.28, 0.08), paint);
-      pil.position.set(0, 0.72, z);
-      body.add(pil);
-    }
-    roofY = 0.98;
-    const roof = new THREE.Mesh(rbox(W - 0.14, 0.06, L - 0.62, 0.03), roofPaint);
-    roof.position.set(0, roofY + 0.01, 0.2);
-    body.add(roof);
-    roofY += 0.045;
-    addWheels(body, W, [-L / 2 + 0.48, L / 2 - 0.48]);
-    lights(body, W, L, 0.42);
-  } else {
-    const lower = new THREE.Mesh(rbox(W, 0.34, L, 0.14), paint);
-    lower.position.y = 0.38;
-    const cabin = new THREE.Mesh(rbox(W - 0.1, 0.3, L * 0.56, 0.12), mats.glass);
-    cabin.position.set(0, 0.66, 0.06);
-    const cap = new THREE.Mesh(rbox(W - 0.12, 0.07, L * 0.5, 0.04), roofPaint);
-    cap.position.set(0, 0.83, 0.06);
-    const stripe = new THREE.Mesh(rbox(W + 0.03, 0.06, L + 0.03, 0.03), trimPaint);
-    stripe.position.y = 0.3;
-    body.add(lower, cabin, cap, stripe);
-    roofY = 0.865;
-    addWheels(body, W, [-L / 2 + 0.38, L / 2 - 0.4]);
-    lights(body, W, L, 0.42);
-  }
-
-  body.traverse((m) => {
-    if (m.isMesh) { m.castShadow = true; m.receiveShadow = true; }
-  });
-
-  // Direction arrow on the roof.
-  const arrow = new THREE.Mesh(arrowGeometry(), mats.white);
-  const s = type === 'car' ? 0.62 : type === 'van' ? 0.8 : 0.92;
-  arrow.scale.set(s, 1, s * (type === 'bus' ? 1.45 : 1.1));
-  arrow.position.set(0, roofY, type === 'car' ? 0.06 : type === 'van' ? 0.15 : 0);
-  arrow.castShadow = false;
-  body.add(arrow);
-
-  // Invisible, slightly oversized hit box for easy tapping.
-  const hit = new THREE.Mesh(box(W + 0.3, 1.4, L + 0.25), new THREE.MeshBasicMaterial({ visible: false }));
-  hit.position.y = 0.6;
+  const hit = new THREE.Mesh(cached(`hit${type}`, () => new THREE.BoxGeometry(t.wid + 0.22, 1.2, t.len + 0.18)),
+    cached('hitMat', () => new THREE.MeshBasicMaterial({ visible: false })));
+  hit.position.y = 0.5;
   root.add(hit);
-
-  return { root, body, paint, roofPaint, trimPaint, hit, roofY, arrow };
+  const roofY = type === 'car' ? 0.75 : 0.82;
+  return { root, body, paint: paintMat, hit, roofY };
 }
 
 export function setVehicleColor(v, hex) {
   v.paint.color.set(hex);
-  v.roofPaint.color.copy(shade(hex, 1.18));
-  v.trimPaint.color.copy(shade(hex, 0.72));
 }
 
-// ---------- Passengers ----------
-const personMats = new Map();
-function personMat(hex) {
-  if (!personMats.has(hex)) personMats.set(hex, new THREE.MeshStandardMaterial({ color: hex, roughness: 0.55 }));
-  return personMats.get(hex);
-}
-const bodyGeo = new THREE.CapsuleGeometry(0.105, 0.2, 4, 10);
-const headGeo = new THREE.SphereGeometry(0.095, 14, 10);
-const hairGeo = new THREE.SphereGeometry(0.1, 14, 8, 0, Math.PI * 2, 0, Math.PI * 0.55);
-const legGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.16, 6);
-
-export function buildPassenger(hex) {
-  const g = new THREE.Group();
-  const inner = new THREE.Group();
-  g.add(inner);
-  const torso = new THREE.Mesh(bodyGeo, personMat(hex));
-  torso.position.y = 0.32;
-  const head = new THREE.Mesh(headGeo, mats.skin);
-  head.position.y = 0.57;
-  const hair = new THREE.Mesh(hairGeo, mats.hair);
-  hair.position.y = 0.585;
-  hair.rotation.x = 0.25;
-  const l1 = new THREE.Mesh(legGeo, mats.chassis);
-  l1.position.set(-0.05, 0.09, 0);
-  const l2 = l1.clone();
-  l2.position.x = 0.05;
-  inner.add(torso, head, hair, l1, l2);
-  torso.castShadow = true;
+// ---------- Passengers (instanced crowd) ----------
+// Round, friendly bean people: a soft body and a big round head in the same color.
+export function buildCrowd(max) {
+  const bodyGeo = new THREE.CapsuleGeometry(0.11, 0.1, 4, 10);
+  bodyGeo.translate(0, 0.2, 0);
+  const headGeo = new THREE.SphereGeometry(0.125, 14, 10);
+  headGeo.translate(0, 0.45, 0);
+  const eyeGeo = mergeGeometries([
+    new THREE.SphereGeometry(0.026, 8, 6).translate(-0.05, 0.48, -0.108),
+    new THREE.SphereGeometry(0.026, 8, 6).translate(0.05, 0.48, -0.108),
+  ]);
+  const mat = new THREE.MeshStandardMaterial({ roughness: 0.5 });
+  const headMat = new THREE.MeshStandardMaterial({ roughness: 0.45 });
+  const eyeMat = new THREE.MeshBasicMaterial({ color: 0x2a2433 });
+  const body = new THREE.InstancedMesh(bodyGeo, mat, max);
+  const head = new THREE.InstancedMesh(headGeo, headMat, max);
+  const eyes = new THREE.InstancedMesh(eyeGeo, eyeMat, max);
+  for (const m of [body, head, eyes]) {
+    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    m.frustumCulled = false;
+  }
+  body.castShadow = true;
   head.castShadow = true;
-  g.userData.legs = [l1, l2];
-  g.userData.inner = inner;
-  return g;
+  const white = new THREE.Color(1, 1, 1);
+  for (let i = 0; i < max; i++) { body.setColorAt(i, white); head.setColorAt(i, white); }
+  const group = new THREE.Group();
+  group.add(body, head, eyes);
+  const m4 = new THREE.Matrix4();
+  const q = new THREE.Quaternion();
+  const up = new THREE.Vector3(0, 1, 0);
+  const pos = new THREE.Vector3();
+  const scl = new THREE.Vector3();
+  const tmpC = new THREE.Color();
+  return {
+    group,
+    max,
+    setColor(i, hex) {
+      tmpC.set(hex);
+      body.setColorAt(i, tmpC);
+      tmpC.lerp(white, 0.18);
+      head.setColorAt(i, tmpC);
+      body.instanceColor.needsUpdate = true;
+      head.instanceColor.needsUpdate = true;
+    },
+    set(i, x, y, z, rotY, s, squash = 1) {
+      pos.set(x, y, z);
+      q.setFromAxisAngle(up, rotY);
+      scl.set(s, s * squash, s);
+      m4.compose(pos, q, scl);
+      body.setMatrixAt(i, m4);
+      head.setMatrixAt(i, m4);
+      eyes.setMatrixAt(i, m4);
+    },
+    commit() {
+      body.instanceMatrix.needsUpdate = true;
+      head.instanceMatrix.needsUpdate = true;
+      eyes.instanceMatrix.needsUpdate = true;
+    },
+  };
 }
 
 // ---------- Text sprites ----------
@@ -284,267 +248,292 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-// ---------- World ----------
-function canvasTexture(w, h, draw, repeat) {
+// Flat text painted on the ground (bay markings).
+function groundText(text, color, w, h, size) {
   const c = document.createElement('canvas');
-  c.width = w;
-  c.height = h;
-  draw(c.getContext('2d'), w, h);
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = 4;
-  if (repeat) {
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.repeat.set(repeat[0], repeat[1]);
-  }
-  return t;
+  c.width = 256;
+  c.height = 128;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = color;
+  ctx.font = `900 ${size}px ui-rounded, "SF Pro Rounded", system-ui, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 128, 68);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
+  m.rotation.x = -Math.PI / 2;
+  return m;
 }
 
-function noiseFill(ctx, w, h, base, spread, n) {
-  ctx.fillStyle = base;
-  ctx.fillRect(0, 0, w, h);
-  for (let i = 0; i < n; i++) {
-    const a = Math.random() * spread;
-    ctx.fillStyle = Math.random() < 0.5 ? `rgba(255,255,255,${a})` : `rgba(0,0,0,${a})`;
-    const s = 1 + Math.random() * 3;
-    ctx.fillRect(Math.random() * w, Math.random() * h, s, s);
-  }
+// Rounded-rectangle outline lying on the ground.
+function frame(w, h, t, r, color) {
+  const outer = new THREE.Shape();
+  const rr = (s, x0, y0, x1, y1, rad) => {
+    s.moveTo(x0 + rad, y0);
+    s.lineTo(x1 - rad, y0); s.quadraticCurveTo(x1, y0, x1, y0 + rad);
+    s.lineTo(x1, y1 - rad); s.quadraticCurveTo(x1, y1, x1 - rad, y1);
+    s.lineTo(x0 + rad, y1); s.quadraticCurveTo(x0, y1, x0, y1 - rad);
+    s.lineTo(x0, y0 + rad); s.quadraticCurveTo(x0, y0, x0 + rad, y0);
+  };
+  rr(outer, -w / 2, -h / 2, w / 2, h / 2, r);
+  const hole = new THREE.Path();
+  rr(hole, -w / 2 + t, -h / 2 + t, w / 2 - t, h / 2 - t, Math.max(0.02, r - t));
+  outer.holes.push(hole);
+  const g = new THREE.ExtrudeGeometry(outer, { depth: 0.03, bevelEnabled: false, curveSegments: 6 });
+  g.rotateX(-Math.PI / 2);
+  return new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color, roughness: 0.5 }));
 }
 
-let grassTex, asphaltTex, lotTex;
-function textures() {
-  if (grassTex) return;
-  grassTex = canvasTexture(256, 256, (ctx, w, h) => {
-    noiseFill(ctx, w, h, '#79c95a', 0.08, 2600);
-    for (let i = 0; i < 260; i++) {
-      ctx.strokeStyle = `rgba(40,110,30,${0.12 + Math.random() * 0.15})`;
-      ctx.lineWidth = 1.5;
-      const x = Math.random() * w, y = Math.random() * h;
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(x + (Math.random() - 0.5) * 4, y - 5 - Math.random() * 4);
-      ctx.stroke();
-    }
-  }, [18, 18]);
-  asphaltTex = canvasTexture(256, 256, (ctx, w, h) => noiseFill(ctx, w, h, '#4c5260', 0.07, 5000), [6, 6]);
-  lotTex = canvasTexture(256, 256, (ctx, w, h) => noiseFill(ctx, w, h, '#646b7a', 0.06, 5000), [4, 4]);
-}
-
-function addTree(group, x, z, s, rng) {
-  const trunk = new THREE.Mesh(cached('trunk', () => new THREE.CylinderGeometry(0.09, 0.13, 0.6, 7)),
-    cached('trunkMat', () => new THREE.MeshStandardMaterial({ color: 0x8a5a35, roughness: 0.9 })));
-  trunk.position.set(x, 0.3 * s, z);
-  trunk.scale.setScalar(s);
-  trunk.castShadow = true;
-  group.add(trunk);
-  const greens = [0x3fae4a, 0x4cc25a, 0x2f9a45, 0x5bc95e];
-  const leafMat = cached('leaf' + Math.floor(rng() * 4), () =>
-    new THREE.MeshStandardMaterial({ color: greens[Math.floor(Math.random() * 4)], roughness: 0.8, flatShading: true }));
-  const crownGeo = cached('crown', () => new THREE.IcosahedronGeometry(0.55, 0));
-  for (let i = 0; i < 2; i++) {
-    const c = new THREE.Mesh(crownGeo, leafMat);
-    c.position.set(x + (rng() - 0.5) * 0.2 * s, (0.85 + i * 0.4) * s, z + (rng() - 0.5) * 0.2 * s);
-    c.scale.setScalar(s * (1 - i * 0.3));
-    c.rotation.set(rng() * 3, rng() * 3, 0);
-    c.castShadow = true;
-    group.add(c);
-  }
-}
-
-function addBush(group, x, z, s, rng) {
-  const mat = cached('bushMat', () => new THREE.MeshStandardMaterial({ color: 0x46b750, roughness: 0.85, flatShading: true }));
-  const geo = cached('bush', () => new THREE.IcosahedronGeometry(0.3, 1));
-  for (let i = 0; i < 3; i++) {
-    const b = new THREE.Mesh(geo, mat);
-    b.position.set(x + (i - 1) * 0.28 * s, 0.18 * s, z + (rng() - 0.5) * 0.15);
-    b.scale.setScalar(s * (0.8 + rng() * 0.4));
-    b.castShadow = true;
-    group.add(b);
-  }
-}
-
-function addFlowerBed(group, x, z, rng) {
-  const cols = [0xff6b8b, 0xffd23d, 0xffffff, 0xb07cff];
-  const geo = cached('flower', () => new THREE.SphereGeometry(0.06, 6, 5));
-  for (let i = 0; i < 6; i++) {
-    const m = cached('fl' + i % 4, () => new THREE.MeshStandardMaterial({ color: cols[i % 4], roughness: 0.6 }));
-    const f = new THREE.Mesh(geo, m);
-    f.position.set(x + (rng() - 0.5) * 0.7, 0.07, z + (rng() - 0.5) * 0.7);
-    group.add(f);
-  }
-}
-
-function dash(group, mat, x, z, w, d) {
-  const m = new THREE.Mesh(box(w, 0.012, d), mat);
-  m.position.set(x, 0.048, z);
-  m.receiveShadow = true;
-  group.add(m);
-}
-
-// Layout geometry shared between world building and gameplay.
+// ---------- Layout ----------
+export const N_BAYS = 8; // VIP + 4 regular + 3 locked extras
 export function computeLayout(level, maxSlots) {
   const hw = level.lotW / 2, hh = level.lotH / 2;
-  const ro = 0.95; // ring road centre offset from lot edge
-  const bayW = 1.34;
-  const bayLen = 3.7;
-  const ring = { x0: -hw - ro, x1: hw + ro, z0: -hh - ro, z1: hh + ro };
-  const bayBottom = ring.z0 - 0.85;
-  const bayTop = bayBottom - bayLen;
-  // Bays left to right: the VIP spot, then the regular spots. slotsX[maxSlots] is the VIP spot.
-  const nBays = maxSlots + 1;
-  const bayX = (k) => (k - (nBays - 1) / 2) * bayW;
+  const bayW = (ROW_HALF_W * 2) / N_BAYS;
+  const bayLen = 2.75;
+  const rowBottom = -hh - 1.3;
+  const rowTop = rowBottom - bayLen;
+  const laneZ = -hh - 0.72;
+  const ring = { x0: -Math.max(hw + 0.75, 2.5), x1: Math.max(hw + 0.75, 2.5), z0: laneZ, z1: hh + 0.75 };
+  const bayX = (k) => (k - (N_BAYS - 1) / 2) * bayW;
+  // slotsX[0..maxSlots-1] are the regular spots (4 open + extras); slotsX[maxSlots] is VIP.
   const slotsX = [];
   for (let i = 0; i < maxSlots; i++) slotsX.push(bayX(i + 1));
   slotsX.push(bayX(0));
-  const exitZ = bayTop - 0.72;
-  const queueHeadZ = exitZ - 1.05;
-  const queueHalfW = Math.max(hw + 0.4, (nBays * bayW) / 2 - 0.2);
-  return { hw, hh, ro, bayW, bayLen, ring, bayBottom, bayTop, slotsX, nBays, vipSlot: maxSlots, exitZ, queueHeadZ, queueHalfW };
+  const gate = { x: 0, z: rowTop - 0.62 };
+  return { hw, hh, bayW, bayLen, rowTop, rowBottom, laneZ, ring, slotsX, vipSlot: maxSlots, gate };
 }
 
-export function buildWorld(level, layout, maxSlots, seed) {
-  textures();
+// ---------- World ----------
+export const THEMES = [
+  { name: 'blossom', sky: 0xf7dcd8, top: 0xf2c9c4, floor: 0xe4e2ec, lot: 0xeeedf4, leaf: [0xf7a8c0, 0xf5bfd0, 0xffd2df], trunk: 0x8a5a4a },
+  { name: 'meadow', sky: 0xd6efd0, top: 0xbfe3b4, floor: 0xe2e6e8, lot: 0xedf0f1, leaf: [0x5cc46b, 0x7fd57a, 0x48b05a], trunk: 0x8a5a35 },
+  { name: 'beach', sky: 0xd8eefa, top: 0xf6e3b8, floor: 0xe3e7ee, lot: 0xeef1f6, leaf: [0x3fbf7a, 0x5ad18e, 0x2ea86a], trunk: 0xa8763e },
+  { name: 'snow', sky: 0xe6f0fb, top: 0xf2f6fc, floor: 0xdfe4ee, lot: 0xebeff6, leaf: [0x6fa58a, 0x7fb89c, 0x5d927a], trunk: 0x7a5a45 },
+  { name: 'autumn', sky: 0xf8e2c8, top: 0xf0cfa2, floor: 0xe6e2e2, lot: 0xf0edec, leaf: [0xf09a3e, 0xe8763a, 0xf5c04a], trunk: 0x7a4a2e },
+];
+export function themeFor(n) {
+  return THEMES[Math.floor((n - 1) / 10) % THEMES.length];
+}
+
+function ribbon(pts, closed, halfW, y, thick) {
+  // Flat strip along a path, `thick` tall.
+  const pos = [];
+  const idx = [];
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    const a = pts[closed ? (i - 1 + n) % n : Math.max(0, i - 1)];
+    const b = pts[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    let tx = b.x - a.x, tz = b.z - a.z;
+    const l = Math.hypot(tx, tz) || 1;
+    tx /= l; tz /= l;
+    const nx = -tz, nz = tx;
+    const p = pts[i];
+    pos.push(p.x + nx * halfW, y + thick, p.z + nz * halfW, p.x - nx * halfW, y + thick, p.z - nz * halfW);
+  }
+  const segs = closed ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    const a = i * 2, b = ((i + 1) % n) * 2;
+    idx.push(a, b, a + 1, a + 1, b, b + 1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+// Raised wall along one side of a path; `skip(i)` leaves gaps (gate, merges).
+function wall(pts, closed, side, offset, h, w, skip) {
+  const geos = [];
+  const n = pts.length;
+  const segs = closed ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    if (skip && skip(i)) continue;
+    const p = pts[i], q = pts[(i + 1) % n];
+    const a = pts[closed ? (i - 1 + n) % n : Math.max(0, i - 1)];
+    const b = pts[closed ? (i + 2) % n : Math.min(n - 1, i + 2)];
+    let tx = b.x - a.x, tz = b.z - a.z;
+    const l = Math.hypot(tx, tz) || 1;
+    tx /= l; tz /= l;
+    const nx = -tz * side, nz = tx * side;
+    const mx = (p.x + q.x) / 2 + nx * offset, mz = (p.z + q.z) / 2 + nz * offset;
+    const len = Math.hypot(q.x - p.x, q.z - p.z) + 0.04;
+    const g = new THREE.BoxGeometry(w, h, len);
+    g.rotateY(Math.atan2(q.x - p.x, q.z - p.z));
+    g.translate(mx, h / 2, mz);
+    geos.push(g.toNonIndexed());
+  }
+  return geos.length ? mergeGeometries(geos) : null;
+}
+
+function addTree(group, theme, x, z, s, rng) {
+  const trunk = new THREE.Mesh(cached('trunk', () => new THREE.CylinderGeometry(0.07, 0.1, 0.5, 7)),
+    cached('trunk' + theme.name, () => new THREE.MeshStandardMaterial({ color: theme.trunk, roughness: 0.9 })));
+  trunk.position.set(x, 0.25 * s, z);
+  trunk.scale.setScalar(s);
+  trunk.castShadow = true;
+  group.add(trunk);
+  for (let i = 0; i < 3; i++) {
+    const col = theme.leaf[Math.floor(rng() * theme.leaf.length)];
+    const leaf = new THREE.Mesh(cached('crown', () => new THREE.IcosahedronGeometry(0.42, 1)),
+      cached(`leaf${col}`, () => new THREE.MeshStandardMaterial({ color: col, roughness: 0.85, flatShading: true })));
+    leaf.position.set(x + (rng() - 0.5) * 0.45 * s, (0.65 + rng() * 0.35) * s, z + (rng() - 0.5) * 0.4 * s);
+    leaf.scale.setScalar(s * (0.75 + rng() * 0.35));
+    leaf.castShadow = true;
+    group.add(leaf);
+  }
+}
+
+function addRock(group, x, z, s) {
+  const r = new THREE.Mesh(cached('rock', () => new THREE.DodecahedronGeometry(0.22, 0)),
+    cached('rockMat', () => new THREE.MeshStandardMaterial({ color: 0xb9b6c2, roughness: 0.9, flatShading: true })));
+  r.position.set(x, 0.1 * s, z);
+  r.scale.set(s, s * 0.7, s);
+  r.castShadow = true;
+  group.add(r);
+}
+
+function addLantern(group, x, z) {
+  const mat = cached('stoneMat', () => new THREE.MeshStandardMaterial({ color: 0xd7d4dc, roughness: 0.85 }));
+  const parts = [[0.18, 0.08, 0.18, 0.04], [0.06, 0.4, 0.06, 0.28], [0.24, 0.16, 0.24, 0.56], [0.3, 0.06, 0.3, 0.68]];
+  for (const [w, h, d, y] of parts) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    m.position.set(x, y, z);
+    m.castShadow = true;
+    group.add(m);
+  }
+}
+
+export function buildWorld(level, layout, track, maxSlots, unlocked, seed) {
   let s = seed >>> 0;
   const rng = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const theme = themeFor(level.n);
   const g = new THREE.Group();
-  const { hw, hh, ring, bayTop, bayBottom, slotsX, bayW, nBays, vipSlot, exitZ, queueHeadZ, queueHalfW } = layout;
+  const { hw, hh, bayW, bayLen, rowTop, rowBottom, slotsX } = layout;
 
-  const grass = new THREE.Mesh(new THREE.PlaneGeometry(90, 90), new THREE.MeshStandardMaterial({ map: grassTex, roughness: 1 }));
-  grass.rotation.x = -Math.PI / 2;
-  grass.receiveShadow = true;
-  g.add(grass);
+  // Ground: themed garden at the top, light floor for the parking area.
+  const topGround = new THREE.Mesh(new THREE.PlaneGeometry(80, 40), new THREE.MeshStandardMaterial({ color: theme.top, roughness: 1 }));
+  topGround.rotation.x = -Math.PI / 2;
+  topGround.position.set(0, 0, rowTop - 20 + 0.4);
+  topGround.receiveShadow = true;
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(80, 40), new THREE.MeshStandardMaterial({ color: theme.floor, roughness: 1 }));
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.set(0, 0, rowBottom + 20 - 0.2);
+  floor.receiveShadow = true;
+  g.add(topGround, floor);
 
-  const asphalt = new THREE.MeshStandardMaterial({ map: asphaltTex, roughness: 0.95 });
-  const lineMat = new THREE.MeshStandardMaterial({ color: 0xf4f4f0, roughness: 0.6 });
-  const yellowMat = new THREE.MeshStandardMaterial({ color: 0xffcf3a, roughness: 0.6 });
-  const curbMat = new THREE.MeshStandardMaterial({ color: 0xe8e4da, roughness: 0.8 });
-  const sidewalkMat = new THREE.MeshStandardMaterial({ color: 0xe9dcc0, roughness: 0.9 });
-
-  // Ring road + bay apron as one slab.
-  const rw = 1.35;
-  const roadX0 = ring.x0 - rw / 2, roadX1 = ring.x1 + rw / 2;
-  const padHalf = Math.max(roadX1, (nBays * bayW) / 2 + 0.3);
-  const road = new THREE.Mesh(rbox(roadX1 - roadX0, 0.04, ring.z1 + rw / 2 - (ring.z0 - rw / 2), 0.4, 2), asphalt);
-  road.position.set(0, 0.02, (ring.z1 + rw / 2 + ring.z0 - rw / 2) / 2);
-  road.receiveShadow = true;
-  g.add(road);
-  const apronD = ring.z0 - rw / 2 - (exitZ - 0.7);
-  const apron = new THREE.Mesh(box(padHalf * 2 + 30, 0.04, apronD), asphalt);
-  apron.position.set(0, 0.021, exitZ - 0.7 + apronD / 2);
-  apron.receiveShadow = true;
-  g.add(apron);
-
-  // Lot surface with a curb.
-  const curb = new THREE.Mesh(rbox(level.lotW + 0.3, 0.1, level.lotH + 0.3, 0.12, 2), curbMat);
-  curb.position.y = 0.05;
-  curb.receiveShadow = true;
-  g.add(curb);
-  const lot = new THREE.Mesh(rbox(level.lotW, 0.1, level.lotH, 0.08, 2), new THREE.MeshStandardMaterial({ map: lotTex, roughness: 0.92 }));
-  lot.position.y = 0.06;
+  // Parking lot pad.
+  const lot = new THREE.Mesh(rbox(level.lotW + 0.5, 0.04, level.lotH + 0.5, 0.02, 1), new THREE.MeshStandardMaterial({ color: theme.lot, roughness: 0.95 }));
+  lot.position.y = 0.0;
   lot.receiveShadow = true;
   g.add(lot);
-  // Faint parking grid on the lot.
-  const gridMat = new THREE.MeshStandardMaterial({ color: 0x7c8494, roughness: 0.9 });
-  for (let x = -hw + 1.5; x < hw - 0.5; x += 1.5) {
-    const m = new THREE.Mesh(box(0.05, 0.005, level.lotH - 0.5), gridMat);
-    m.position.set(x, 0.113, 0);
+
+  // Parking row: dark strip with rounded bays.
+  const stripD = bayLen + 1.25;
+  const strip = new THREE.Mesh(rbox(80, 0.06, stripD, 0.03, 1), new THREE.MeshStandardMaterial({ color: 0x5d6070, roughness: 0.9 }));
+  strip.position.set(0, 0.0, rowTop + stripD / 2 - 0.45);
+  strip.receiveShadow = true;
+  g.add(strip);
+  const lip = new THREE.Mesh(new THREE.BoxGeometry(80, 0.08, 0.12), new THREE.MeshStandardMaterial({ color: 0xc9cbd6, roughness: 0.8 }));
+  lip.position.set(0, 0.04, rowTop - 0.45);
+  g.add(lip);
+  const bayFill = new THREE.MeshStandardMaterial({ color: 0x6c7080, roughness: 0.9 });
+  const bayCenterZ = (rowTop + rowBottom) / 2;
+  const bays = [];
+  for (let k = 0; k < N_BAYS; k++) {
+    const x = (k - (N_BAYS - 1) / 2) * bayW;
+    const isVip = k === 0;
+    const slotIndex = isVip ? maxSlots : k - 1;
+    const locked = !isVip && slotIndex >= unlocked;
+    const color = isVip ? 0xffbf2e : locked ? 0x5fd17a : 0xa3a7b6;
+    const f = frame(bayW - 0.16, bayLen - 0.1, 0.07, 0.2, color);
+    f.position.set(x, 0.03, bayCenterZ);
+    g.add(f);
+    const fill = new THREE.Mesh(new THREE.PlaneGeometry(bayW - 0.26, bayLen - 0.2), bayFill);
+    fill.rotation.x = -Math.PI / 2;
+    fill.position.set(x, 0.035, bayCenterZ);
+    g.add(fill);
+    let mark = null;
+    if (isVip) {
+      mark = groundText('VIP', '#ffbf2e', 1.1, 0.55, 84);
+      mark.rotation.z = Math.PI / 2;
+    } else if (locked) mark = groundText('+', '#5fd17a', 1.0, 0.5, 120);
+    if (mark) {
+      mark.position.set(x, 0.05, bayCenterZ);
+      g.add(mark);
+    }
+    bays.push({ k, x, slotIndex, isVip, locked, frame: f, mark });
+  }
+  void slotsX;
+
+  // Passenger track: a light floor with soft white walls; gaps at the gate and where arms join.
+  const trackMat = new THREE.MeshStandardMaterial({ color: 0x8e8c99, roughness: 0.9 });
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0xf4f2f7, roughness: 0.6 });
+  const half = TRACK_W / 2;
+  const loopFloor = new THREE.Mesh(ribbon(track.loop, true, half, 0.0, 0.02), trackMat);
+  loopFloor.receiveShadow = true;
+  g.add(loopFloor);
+  let cx = 0, cz = 0;
+  for (const p of track.loop) { cx += p.x; cz += p.z; }
+  cx /= track.loop.length; cz /= track.loop.length;
+  const n = track.loop.length;
+  const near = (i, j, d) => Math.min((i - j + n) % n, (j - i + n) % n) <= d;
+  // Work out which side of the path is the outside of the loop.
+  const p0 = track.loop[0], p1 = track.loop[1];
+  const nx = -(p1.z - p0.z), nz = p1.x - p0.x;
+  const outerSide = (nx * (p0.x - cx) + nz * (p0.z - cz)) > 0 ? 1 : -1;
+  const outer = wall(track.loop, true, outerSide, half + 0.06, 0.16, 0.12, (i) => near(i, track.gateIdx, 2) || track.merges.some((m) => near(i, m, 2)));
+  const inner = wall(track.loop, true, -outerSide, half + 0.06, 0.16, 0.12, null);
+  for (const w of [outer, inner]) {
+    if (!w) continue;
+    const m = new THREE.Mesh(w, wallMat);
+    m.castShadow = true;
     m.receiveShadow = true;
     g.add(m);
   }
-
-  // Lane dashes on the ring road centreline.
-  const dashLen = 0.45, gap = 0.45;
-  for (let x = ring.x0 + 0.8; x < ring.x1 - 0.8; x += dashLen + gap) {
-    dash(g, lineMat, x + dashLen / 2, ring.z1, dashLen, 0.07);
-  }
-  for (let z = ring.z0 + 0.8; z < ring.z1 - 0.8; z += dashLen + gap) {
-    dash(g, lineMat, ring.x0, z + dashLen / 2, 0.07, dashLen);
-    dash(g, lineMat, ring.x1, z + dashLen / 2, 0.07, dashLen);
-  }
-  // Exit road centre line.
-  for (let x = -padHalf - 12; x < padHalf + 12; x += dashLen + gap) dash(g, yellowMat, x, exitZ, dashLen, 0.07);
-
-  // Parking bays.
-  for (let i = 0; i <= nBays; i++) {
-    const x = -(nBays * bayW) / 2 + i * bayW;
-    dash(g, lineMat, x, (bayTop + bayBottom) / 2, 0.08, bayBottom - bayTop);
-  }
-  dash(g, lineMat, 0, bayBottom, nBays * bayW + 0.08, 0.08);
-  // VIP spot: gold pad with a sign.
-  const vipMat = new THREE.MeshStandardMaterial({ color: 0xffc21a, roughness: 0.55, transparent: true, opacity: 0.55 });
-  const vipPad = new THREE.Mesh(box(bayW - 0.18, 0.012, bayBottom - bayTop - 0.16), vipMat);
-  vipPad.position.set(slotsX[vipSlot], 0.046, (bayTop + bayBottom) / 2);
-  vipPad.receiveShadow = true;
-  g.add(vipPad);
-  const vipSign = makeLabel('VIP', { w: 1.0, bg: 'rgba(255,194,26,0.97)', fg: '#5a3a00', size: 70, border: '#fff' });
-  vipSign.position.set(slotsX[vipSlot], 0.35, bayBottom + 0.05);
-  g.add(vipSign);
-
-  // Sidewalk for the queue.
-  const swDepth = 4.6;
-  const sw = new THREE.Mesh(rbox(queueHalfW * 2 + 2.4, 0.12, swDepth, 0.1, 2), sidewalkMat);
-  sw.position.set(0, 0.06, queueHeadZ + 0.6 - swDepth / 2);
-  sw.receiveShadow = true;
-  g.add(sw);
-  const swCurb = new THREE.Mesh(box(queueHalfW * 2 + 2.4, 0.14, 0.14), curbMat);
-  swCurb.position.set(0, 0.07, queueHeadZ + 0.6);
-  g.add(swCurb);
-  // Queue rails.
-  const railMat = new THREE.MeshStandardMaterial({ color: 0xffb02e, roughness: 0.4, metalness: 0.3 });
-  const postGeo = cached('post', () => new THREE.CylinderGeometry(0.035, 0.035, 0.42, 8));
-  for (let r = 0; r < 3; r++) {
-    const z = queueHeadZ - 0.32 - r * 0.62;
-    const x0 = r % 2 === 0 ? -queueHalfW + 0.6 : -queueHalfW;
-    const x1 = r % 2 === 0 ? queueHalfW : queueHalfW - 0.6;
-    const rail = new THREE.Mesh(box(x1 - x0, 0.04, 0.04), railMat);
-    rail.position.set((x0 + x1) / 2, 0.42, z);
-    rail.castShadow = true;
-    g.add(rail);
-    for (let x = x0; x <= x1 + 0.01; x += (x1 - x0) / 6) {
-      const p = new THREE.Mesh(postGeo, railMat);
-      p.position.set(x, 0.33, z);
-      p.castShadow = true;
-      g.add(p);
+  // Inner island.
+  const islandShape = new THREE.Shape(track.loop.map((p) => new THREE.Vector2(p.x, -p.z)));
+  const island = new THREE.Mesh(new THREE.ShapeGeometry(islandShape), new THREE.MeshStandardMaterial({ color: theme.top, roughness: 1 }));
+  island.rotation.x = -Math.PI / 2;
+  island.position.y = 0.005;
+  g.add(island);
+  for (const arm of track.arms) {
+    const pts = arm.pts.slice(1);
+    const fl = new THREE.Mesh(ribbon(pts, false, half, 0.0, 0.021), trackMat);
+    fl.receiveShadow = true;
+    g.add(fl);
+    for (const side of [1, -1]) {
+      const w = wall(pts, false, side, half + 0.06, 0.16, 0.12, (i) => i < 2);
+      if (!w) continue;
+      const m = new THREE.Mesh(w, wallMat);
+      m.castShadow = true;
+      g.add(m);
     }
   }
-  // Bus-stop shelter behind the queue head.
-  const shelterMat = new THREE.MeshStandardMaterial({ color: 0x2f7cf6, roughness: 0.4 });
-  const glassMat = new THREE.MeshStandardMaterial({ color: 0xbfe6ff, roughness: 0.1, transparent: true, opacity: 0.45 });
-  const sx = queueHalfW + 0.25;
-  const roof = new THREE.Mesh(rbox(1.3, 0.08, 0.8, 0.03), shelterMat);
-  roof.position.set(sx, 1.05, queueHeadZ - 0.1);
-  roof.castShadow = true;
-  const back = new THREE.Mesh(box(1.2, 0.85, 0.04), glassMat);
-  back.position.set(sx, 0.6, queueHeadZ - 0.45);
-  const pole1 = new THREE.Mesh(box(0.06, 1.0, 0.06), shelterMat);
-  pole1.position.set(sx - 0.6, 0.55, queueHeadZ - 0.45);
-  const pole2 = pole1.clone();
-  pole2.position.x = sx + 0.6;
-  const sign = new THREE.Mesh(cached('signGeo', () => new THREE.CylinderGeometry(0.17, 0.17, 0.04, 20)), shelterMat);
-  sign.rotation.x = Math.PI / 2;
-  sign.position.set(-queueHalfW - 0.4, 1.2, queueHeadZ + 0.2);
-  const signPole = new THREE.Mesh(box(0.05, 1.2, 0.05), curbMat);
-  signPole.position.set(-queueHalfW - 0.4, 0.6, queueHeadZ + 0.2);
-  g.add(roof, back, pole1, pole2, sign, signPole);
+  // Gate path from the loop down to the parking row.
+  const gatePad = new THREE.Mesh(new THREE.PlaneGeometry(1.3, 0.8), trackMat);
+  gatePad.rotation.x = -Math.PI / 2;
+  gatePad.position.set(layout.gate.x, 0.012, layout.gate.z + 0.35);
+  g.add(gatePad);
 
-  // Scenery around the edges.
-  const zTop = queueHeadZ - swDepth + 0.3;
-  const zBot = ring.z1 + 1.4;
-  const xEdge = Math.max(roadX1, padHalf) + 0.9;
-  for (let z = zTop - 1.5; z < zBot + 6; z += 1.3 + rng() * 0.6) {
-    for (const side of [-1, 1]) {
-      const x = side * (xEdge + rng() * 1.6);
-      if (z > exitZ - 1.3 && z < exitZ + 1.0) continue; // keep the exit road clear
-      if (rng() < 0.62) addTree(g, x, z, 0.8 + rng() * 0.5, rng);
-      else addBush(g, x, z, 0.9 + rng() * 0.4, rng);
+  // Garden decorations around the track and down the sides.
+  const L = Math.max(hw + 1.2, ROW_HALF_W + 0.9);
+  const spots = [
+    [-ROW_HALF_W - 0.2, rowTop - 1.2], [ROW_HALF_W + 0.2, rowTop - 1.0], [-ROW_HALF_W + 0.4, rowTop - 3.6], [ROW_HALF_W - 0.3, rowTop - 3.9],
+    [cx, cz - 0.1],
+  ];
+  spots.forEach(([x, z], i) => {
+    if (i === 4) addLantern(g, x, z);
+    else addTree(g, theme, x, z, 0.9 + rng() * 0.4, rng);
+  });
+  for (let i = 0; i < 6; i++) addRock(g, (rng() - 0.5) * 2 * (ROW_HALF_W + 0.5), rowTop - 0.9 - rng() * 4, 0.6 + rng() * 0.6);
+  for (const side of [-1, 1]) {
+    for (let z = rowBottom + 0.8; z < hh + 2; z += 1.8 + rng()) {
+      if (rng() < 0.6) addTree(g, theme, side * (L + 0.6 + rng() * 0.6), z, 0.8 + rng() * 0.3, rng);
     }
   }
-  for (let x = -xEdge; x < xEdge; x += 1.4 + rng() * 0.8) {
-    if (rng() < 0.55) addTree(g, x, zBot + 0.4 + rng() * 1.5, 0.8 + rng() * 0.5, rng);
-    else addBush(g, x, zBot + 0.2 + rng() * 0.5, 1, rng);
-    if (rng() < 0.5) addFlowerBed(g, x + 0.6, zBot + 1.6 + rng(), rng);
-    if (rng() < 0.7) addTree(g, x + 0.3, zTop - 0.6 - rng() * 1.5, 0.9 + rng() * 0.5, rng);
-  }
-
-  return g;
+  return { group: g, bays, theme };
 }
+
+export { PER_RANK, laneOffset };
